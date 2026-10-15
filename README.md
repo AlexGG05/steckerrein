@@ -4,18 +4,16 @@ Deutschsprachige Verkaufswebsite mit Kontaktformular (E-Mail, Telefonnummer, Pre
 
 ## Docker Compose über Arcane
 
-Das Projekt enthält einen Dockerfile und eine fertige `compose.yaml`.
+Die Website wird automatisch über GitHub Actions als Docker-Image in der GitHub Container Registry (GHCR) gebaut.
 
-**Wichtig:** Die Compose-Datei nutzt `build: .`. In Arcane muss deshalb der komplette GitHub-Repository-Inhalt als Projektquelle bzw. Build-Kontext verfügbar sein. Nur YAML in ein leeres Compose-Projekt einzufügen reicht nicht, da sonst Dockerfile und Website-Dateien fehlen.
+### Docker Compose für Arcane
 
-### Inhalt für docker-compose.yaml
+Diesen Inhalt in Arcane als Compose-Projekt verwenden (kein Dockerfile oder Git-Checkout erforderlich):
 
 ```yaml
 services:
   steckerrein:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/alexgg05/steckerrein:latest
     container_name: steckerrein
     restart: unless-stopped
     ports:
@@ -24,25 +22,11 @@ services:
       - no-new-privileges:true
 ```
 
-### Bereitstellen
+**Vor dem ersten Deployment:** Unter [GitHub Actions](https://github.com/AlexGG05/steckerrein/actions) prüfen, dass der Workflow „Build and publish Docker image“ erfolgreich gelaufen ist. Das Paket unter GitHub Packages gegebenenfalls auf **Public** stellen, damit Arcane es ohne Zugangsdaten herunterladen kann. Bei privaten Paketen ist eine GHCR-Anmeldung auf dem Docker-Host erforderlich.
 
-Auf dem Docker-Host:
+Nach dem Deployment ist die Website unter `http://SERVER-IP:8095` erreichbar. Für Updates in Arcane das Image erneut pullen und den Container neu erstellen.
 
-```bash
-git clone https://github.com/AlexGG05/steckerrein.git
-cd steckerrein
-docker compose up -d --build
-```
-
-Danach erreichbar über `http://SERVER-IP:8095`.
-
-**Arcane:** Wenn deine Arcane-Version Git-basierte Projekte mit Build-Kontext unterstützt, das Repository `https://github.com/AlexGG05/steckerrein.git` als Projektquelle einrichten und die mitgelieferte Compose-Datei verwenden. Alternativ das Repository auf dem Docker-Host klonen, mit Docker Compose starten und in Arcane verwalten.
-
-Für Updates: `git pull && docker compose up -d --build`.
-
-### Domain
-
-Im Cloudflare Tunnel oder Reverse Proxy `steckerrein.de` auf `http://DOCKER-HOST:8095` weiterleiten und HTTPS aktivieren. Port 8095 bei Bedarf ändern.
+Für `steckerrein.de` den Cloudflare Tunnel oder Reverse Proxy auf `http://DOCKER-HOST:8095` weiterleiten und HTTPS aktivieren.
 
 ## Kontaktformular
 

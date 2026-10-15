@@ -1,0 +1,11 @@
+services:
+  steckerrein:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: steckerrein
+    restart: unless-stopped
+    ports:
+      - "8095:80"
+    security_opt:
+      - no-new-privileges:true

@@ -1,8 +1,6 @@
 services:
   steckerrein:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/alexgg05/steckerrein:latest
     container_name: steckerrein
     restart: unless-stopped
     ports:

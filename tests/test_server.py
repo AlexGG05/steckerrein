@@ -412,4 +412,67 @@ class CommunityTest(unittest.TestCase):
         server.initialize()
         self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['allow_replies'],0)
 
+    def post_image(self, format='PNG', size=(400,200)):
+        import base64,io
+        from PIL import Image,PngImagePlugin
+        image=Image.new('RGB',size,'steelblue');output=io.BytesIO()
+        if format=='PNG':
+            info=PngImagePlugin.PngInfo();info.add_text('private-location','must disappear');image.save(output,format=format,pnginfo=info)
+        elif format=='JPEG':
+            info=Image.Exif();info[270]='private camera note';image.save(output,format=format,exif=info)
+        else:image.save(output,format=format)
+        return {'data':base64.b64encode(output.getvalue()).decode()}
+
+    def test_20_public_post_images_and_metadata(self):
+        import io
+        from PIL import Image
+        cookie,_=self.register('pictureauthor')
+        post={'title':'Mein Setup mit Bildern','body':'Hier seht ihr mein Homelab und meinen 3D-Drucker.','category':'it','images':[self.post_image(),self.post_image('JPEG',(3000,1800))]}
+        status,result,_=self.request('/api/posts','POST',post,cookie);self.assertEqual(status,201);pid=result['id']
+        detail=self.request('/api/posts/'+str(pid))[1]['post'];self.assertEqual(len(detail['images']),2)
+        self.assertEqual(detail['images'][1]['width'],2560);self.assertEqual(detail['images'][1]['height'],1536)
+        for picture in detail['images']:
+            status,raw,_=self.request(picture['url']);self.assertEqual(status,200)
+            with Image.open(io.BytesIO(raw)) as image:
+                self.assertNotIn('private-location',image.info);self.assertNotIn('exif',image.info)
+                self.assertEqual(image.size,(picture['width'],picture['height']))
+        feed=self.request('/api/posts?author=pictureauthor')[1]['posts'][0]
+        self.assertEqual(feed['images'],detail['images'])
+        self.assertEqual(self.request('/media/'+'0'*32)[0],404)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'DELETE',{},cookie)[0],200)
+        self.assertEqual(self.request(detail['images'][0]['url'])[0],404)
+
+    def test_21_edit_image_permissions_and_retention(self):
+        author,_=self.register('imageowner');other,_=self.register('imageother');admin,admin_user=self.register('imageadmin')
+        with server.connect() as db:db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
+        post={'title':'Ein bebilderter Beitrag','body':'Diese Bilder bleiben beim Bearbeiten erhalten.','category':'it','images':[self.post_image(),self.post_image('JPEG')]}
+        status,result,_=self.request('/api/posts','POST',post,author);self.assertEqual(status,201);pid=result['id']
+        pictures=self.request('/api/posts/'+str(pid))[1]['post']['images']
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'images':[]},other)[0],403)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'images':[]})[0],401)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'images':[{'token':pictures[1]['token']}]},author)[0],200)
+        self.assertEqual(self.request(pictures[0]['url'])[0],404)
+        self.assertEqual(self.request(pictures[1]['url'])[0],200)
+        # Omitting images leaves attachments untouched for older clients.
+        no_images={k:v for k,v in post.items() if k!='images'}
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',no_images,author)[0],200)
+        self.assertEqual(len(self.request('/api/posts/'+str(pid))[1]['post']['images']),1)
+        status,value,_=self.request('/api/posts','POST',{**no_images,'images':[{'token':pictures[1]['token']}]},other)
+        self.assertEqual(status,400)
+        self.assertEqual(self.request('/api/posts?author=imageother')[1]['total'],0)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**no_images,'images':[{'token':pictures[1]['token']},{'data':'bad'}]},author)[0],400)
+        self.assertEqual(self.request(pictures[1]['url'])[0],200)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**no_images,'images':[]},admin)[0],200)
+        self.assertEqual(self.request(pictures[1]['url'])[0],404)
+
+    def test_22_invalid_post_images_rollback(self):
+        import base64
+        cookie,_=self.register('imagevalidation')
+        post={'title':'Ein Bild muss gültig sein','body':'Ungültige Bilder dürfen den Beitrag nicht speichern.','category':'it'}
+        invalid=[None,{},[{'data':'bad base64!'}],[{'data':base64.b64encode(b'<svg></svg>').decode()}],[self.post_image('WEBP')],[self.post_image()]*6,[{'token':'not-owned'}]]
+        for images in invalid:
+            self.assertEqual(self.request('/api/posts','POST',{**post,'images':images},cookie)[0],400)
+        self.assertEqual(self.request('/api/posts?author=imagevalidation')[1]['total'],0)
+        self.assertEqual(self.request('/api/posts','POST',{**post,'images':[self.post_image()]} )[0],401)
+
 if __name__=='__main__':unittest.main()

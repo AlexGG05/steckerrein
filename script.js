@@ -3,7 +3,7 @@ const $ = selector => document.querySelector(selector);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let topics = [], categories = {}, user = null, view = 'home', category = '', search = '', page = 1, requestId = 0, modalRequest = 0;
 let returnPath = '/forum';
-let tagCatalog=[],adminSearch='',adminPage=1;
+let tagCatalog=[],adminSearch='',adminPage=1,modalCleanup=null;
 const date = value => new Date(value * 1000).toLocaleDateString('de-DE', {day:'numeric',month:'short',year:'numeric'});
 const canWrite = () => !!(user && user.email_verified);
 const canEdit = item => canWrite() && (user.admin || user.id === item.user_id);
@@ -12,6 +12,10 @@ function avatar(name, hasAvatar, large = false) {
 }
 function authorLink(name, userId, hasAvatar, userTags = []) {
   return userId ? `<a class="author-link" href="/users/${encodeURIComponent(name)}">${avatar(name,hasAvatar)}<span>${esc(name)}</span>${tagBadges(userTags)}</a>` : `<span class="author-link">${avatar(name,false)}<span>${esc(name)}</span></span>`;
+}
+function postImages(post) {
+  if (!post.images?.length) return '';
+  return `<section class="post-image-section" aria-label="Bilder zum Beitrag"><p class="form-note">${post.images.length} ${post.images.length===1 ? 'Bild' : 'Bilder'} · Zum Vergrößern öffnen</p><div class="post-image-grid">${post.images.map((image,index) => `<a href="${esc(image.url)}" target="_blank" rel="noopener" class="post-image"><img src="${esc(image.url)}" width="${image.width}" height="${image.height}" loading="lazy" alt="Bild ${index+1} zu ${esc(post.title)}"><span>Bild vergrößern ↗</span></a>`).join('')}</div></section>`;
 }
 function tagBadges(tags = []) {
   return tags.map(t => `<span class="tag-badge tag-${esc(t.color)}">${esc(t.name)}</span>`).join('');
@@ -42,11 +46,13 @@ function account() {
   for (const button of document.querySelectorAll('[data-action="compose"]')) button.hidden = !canWrite();
 }
 function openModal(html) {
+  if (modalCleanup) {modalCleanup();modalCleanup=null;}
   modalRequest++; $('#modal-content').innerHTML = html;
   if (!$('#modal').open) $('#modal').showModal();
   $('#modal').scrollTop = 0;
 }
 function closeModal(changePath = true) {
+  if (modalCleanup) {modalCleanup();modalCleanup=null;}
   modalRequest++; $('#modal').close();
   if (changePath && location.pathname.startsWith('/posts/')) navigate(returnPath);
 }
@@ -110,7 +116,7 @@ async function renderFeed() {
       const current=topics.find(t => t.slug===category);
       const subtopics=view==='forum' && category && !search ? boardCards(topics.filter(t => t.parent_slug===category)) : '';
       const intro=current && view==='forum' ? `<p class="forum-intro">${esc(current.description)}${current.allow_posts ? '' : current.allow_replies ? '<br>Neue Beiträge sind gesperrt. Du kannst auf vorhandene Beiträge antworten.' : '<br>Neue Beiträge und Antworten sind gesperrt. Wähle ein freigegebenes Unterthema.'}</p>` : '';
-      $('#posts').innerHTML = intro+subtopics+(result.posts.length ? result.posts.map(post => `<article class="post-card"><div class="post-meta"><span class="badge ${post.kind}">${post.kind === 'blog' ? 'AUS DEM BLOG' : 'BEITRAG'}</span><span class="category-text">${esc(categories[post.category])}</span></div><div class="post-tags">${tagBadges(post.tags)}</div><h3><a href="/posts/${post.id}">${esc(post.title)}</a></h3><p>${esc(post.excerpt)}</p><div class="post-bottom">${authorLink(post.author,post.user_id,post.has_avatar,post.author_tags)}<span>·</span><time datetime="${new Date(post.created*1000).toISOString()}">${date(post.created)}</time><span class="reply-count">▤ &nbsp; ${post.comments} ${post.comments === 1 ? 'Antwort' : 'Antworten'}</span></div><span class="card-arrow" aria-hidden="true">→</span></article>`).join('') : `<div class="empty"><h3>${search ? 'Noch kein Treffer.' : 'Noch keine Beiträge.'}</h3><p>${search ? 'Versuche einen anderen Suchbegriff.' : mayCompose() ? 'Erstelle den ersten Beitrag in diesem Themenbereich.' : canWrite() ? 'Beiträge werden in den freigegebenen Unterthemen erstellt.' : 'Melde dich mit einer bestätigten E-Mail-Adresse an, um mitzumachen.'}</p>${mayCompose() ? '<button class="button secondary small" data-action="compose">Beitrag erstellen →</button>' : !canWrite() ? '<button class="button secondary small" data-action="login">Anmelden</button>' : ''}</div>`);
+      $('#posts').innerHTML = intro+subtopics+(result.posts.length ? result.posts.map(post => `<article class="post-card"><div class="post-meta"><span class="badge ${post.kind}">${post.kind === 'blog' ? 'AUS DEM BLOG' : 'BEITRAG'}</span><span class="category-text">${esc(categories[post.category])}</span></div><div class="post-tags">${tagBadges(post.tags)}</div><h3><a href="/posts/${post.id}">${esc(post.title)}</a></h3><p>${esc(post.excerpt)}</p>${post.images?.length ? `<div class="feed-image-preview"><img src="${esc(post.images[0].url)}" alt="Bild zu ${esc(post.title)}" loading="lazy"><span>${post.images.length} ${post.images.length===1 ? 'Bild' : 'Bilder'}</span></div>` : ''}<div class="post-bottom">${authorLink(post.author,post.user_id,post.has_avatar,post.author_tags)}<span>·</span><time datetime="${new Date(post.created*1000).toISOString()}">${date(post.created)}</time><span class="reply-count">▤ &nbsp; ${post.comments} ${post.comments === 1 ? 'Antwort' : 'Antworten'}</span></div><span class="card-arrow" aria-hidden="true">→</span></article>`).join('') : `<div class="empty"><h3>${search ? 'Noch kein Treffer.' : 'Noch keine Beiträge.'}</h3><p>${search ? 'Versuche einen anderen Suchbegriff.' : mayCompose() ? 'Erstelle den ersten Beitrag in diesem Themenbereich.' : canWrite() ? 'Beiträge werden in den freigegebenen Unterthemen erstellt.' : 'Melde dich mit einer bestätigten E-Mail-Adresse an, um mitzumachen.'}</p>${mayCompose() ? '<button class="button secondary small" data-action="compose">Beitrag erstellen →</button>' : !canWrite() ? '<button class="button secondary small" data-action="login">Anmelden</button>' : ''}</div>`);
       if (result.total > 12) $('#pagination').innerHTML = `<button class="plain" data-action="previous" ${page === 1 ? 'disabled' : ''}>← Zurück</button><span>${page} / ${Math.ceil(result.total/12)}</span><button class="plain" data-action="next" ${page*12 >= result.total ? 'disabled' : ''}>Weiter →</button>`;
     }
     const s = result.stats;
@@ -145,11 +151,39 @@ async function compose(post = null) {
   const destinations=orderedTopics().filter(t => kind==='blog' || t.allow_posts || post?.category===t.slug);
   if (!destinations.length) return toast('Es gibt noch keinen Themenbereich, der Beiträge erlaubt.');
   if (!post && view==='forum' && !mayCompose()) return toast('Wähle zuerst ein Unterthema, in dem Beiträge erlaubt sind.');
-  openModal(`<div class="eyebrow">WAS BESCHÄFTIGT DICH?</div><h2 class="modal-title">${post ? 'Beitrag bearbeiten.' : kind === 'blog' ? 'Ein neuer Blogartikel.' : 'Dein Beitrag zur Community.'}</h2><form id="post-form" class="editor-form"><input type="hidden" name="kind" value="${kind}"><label>Themenbereich<select name="category" required>${destinations.map(t => `<option value="${t.slug}" ${(post?.category || category) === t.slug ? 'selected' : ''}>${esc(topicLabel(t))}</option>`).join('')}</select></label><label>Titel<input name="title" required minlength="5" maxlength="140" value="${esc(post?.title || '')}" placeholder="Worum geht es?"></label><fieldset class="tag-fieldset"><legend>Tags (optional, höchstens 10)</legend>${tagChoices('post',post?.tags || [])}</fieldset><label for="post-body">Dein Beitrag</label><textarea id="post-body" name="body" required minlength="20" maxlength="15000" rows="8">${esc(post?.body || '')}</textarea><p class="form-note">Beiträge sind öffentlich. Bleib freundlich und teile keine Passwörter oder persönlichen Daten Dritter.</p><p class="form-error" role="alert"></p><button class="button primary" type="submit">${post ? 'Änderungen speichern' : 'Beitrag veröffentlichen'} →</button></form>`);
-  $('#post-form').addEventListener('submit',async event => {
-    event.preventDefault(); const form = event.currentTarget, button = form.querySelector('button'); button.disabled = true;
+  openModal(`<div class="eyebrow">WAS BESCHÄFTIGT DICH?</div><h2 class="modal-title">${post ? 'Beitrag bearbeiten.' : kind === 'blog' ? 'Ein neuer Blogartikel.' : 'Dein Beitrag zur Community.'}</h2><form id="post-form" class="editor-form"><input type="hidden" name="kind" value="${kind}"><label>Themenbereich<select name="category" required>${destinations.map(t => `<option value="${t.slug}" ${(post?.category || category) === t.slug ? 'selected' : ''}>${esc(topicLabel(t))}</option>`).join('')}</select></label><label>Titel<input name="title" required minlength="5" maxlength="140" value="${esc(post?.title || '')}" placeholder="Worum geht es?"></label><fieldset class="tag-fieldset"><legend>Tags (optional, höchstens 10)</legend>${tagChoices('post',post?.tags || [])}</fieldset><label for="post-body">Dein Beitrag</label><textarea id="post-body" name="body" required minlength="20" maxlength="15000" rows="8">${esc(post?.body || '')}</textarea><label for="post-photos">Bilder hinzufügen (JPG oder PNG)</label><input id="post-photos" name="photos" type="file" accept="image/jpeg,image/png" multiple><p class="form-note">Bis zu 5 Bilder, jeweils höchstens 5 MB und 16 Megapixel. Bilder werden auf maximal 2560 Pixel Seitenlänge verkleinert und ohne Metadaten gespeichert.</p><div id="image-drafts" class="image-drafts" aria-live="polite"></div><p class="form-note">Beiträge und Bilder sind öffentlich. Bleib freundlich und teile keine Passwörter oder persönlichen Daten Dritter.</p><p class="form-error" role="alert"></p><button class="button primary" type="submit">${post ? 'Änderungen speichern' : 'Beitrag veröffentlichen'} →</button></form>`);
+  const formNode=$('#post-form'),editorTicket=modalRequest;
+  let pictures=(post?.images || []).map(image => ({token:image.token,preview:image.url}));
+  modalCleanup=()=>{for (const picture of pictures) if (picture.preview?.startsWith('blob:')) URL.revokeObjectURL(picture.preview);};
+  const renderDrafts=()=>{$('#image-drafts').innerHTML=pictures.map((picture,index)=>`<div class="image-draft"><img src="${esc(picture.preview)}" alt="Bildvorschau ${index+1}"><button type="button" data-remove-image="${index}" aria-label="Bild ${index+1} entfernen">✕</button></div>`).join('');};
+  renderDrafts();
+  formNode.addEventListener('click',event=>{
+    const button=event.target.closest('[data-remove-image]');if(!button)return;
+    const index=Number(button.dataset.removeImage),picture=pictures[index];
+    if(picture.preview?.startsWith('blob:'))URL.revokeObjectURL(picture.preview);
+    pictures.splice(index,1);renderDrafts();
+  });
+  $('#post-photos').addEventListener('change',async event=>{
+    const input=event.currentTarget,files=[...input.files],submit=formNode.querySelector('[type=submit]');submit.disabled=true;input.disabled=true;
     try {
-      const data=Object.fromEntries(new FormData(form));data.tag_ids=new FormData(form).getAll('tag_ids').map(Number);
+      if(pictures.length+files.length>5)throw new Error('Du kannst höchstens fünf Bilder pro Beitrag hinzufügen.');
+      for(const file of files) {
+        if(file.size>5*1024*1024)throw new Error('Jedes Bild darf höchstens 5 MB groß sein.');
+        if(!['image/jpeg','image/png'].includes(file.type) && !/\.(jpe?g|png)$/i.test(file.name))throw new Error('Bitte wähle JPG- oder PNG-Bilder aus.');
+      }
+      for(const file of files) {
+        const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=()=>reject(new Error('Das Bild konnte nicht gelesen werden.'));reader.readAsDataURL(file);});
+        if(editorTicket!==modalRequest)return;
+        pictures.push({data,preview:URL.createObjectURL(file)});
+      }
+      if(editorTicket===modalRequest){renderDrafts();formNode.querySelector('.form-error').textContent='';}
+    } catch(error) {if(editorTicket===modalRequest)formNode.querySelector('.form-error').textContent=error.message;}
+    finally {input.value='';input.disabled=false;submit.disabled=false;}
+  });
+  $('#post-form').addEventListener('submit',async event => {
+    event.preventDefault(); const form = event.currentTarget, button = form.querySelector('[type=submit]'); button.disabled = true;
+    try {
+      const data=Object.fromEntries(new FormData(form));delete data.photos;data.images=pictures.map(picture=>picture.token ? {token:picture.token} : {data:picture.data});data.tag_ids=new FormData(form).getAll('tag_ids').map(Number);
       const result = await api(post ? 'posts/'+post.id : 'posts',post ? 'PATCH' : 'POST',data);
       const id = post ? post.id : result.id;
       await loadTopics(); closeModal(false); toast(post ? 'Änderungen gespeichert.' : 'Dein Beitrag ist veröffentlicht.');
@@ -201,7 +235,7 @@ async function showPost(id) {
   try {
     const {post,comments} = await api('posts/'+id);
     if (ticket !== modalRequest || !$('#modal').open) return;
-    $('#modal-content').innerHTML = `<span class="badge ${post.kind}">${post.kind === 'blog' ? 'BLOG' : 'FORUM'} · ${esc(categories[post.category])}</span><h2 class="modal-title">${esc(post.title)}</h2><div class="article-info">${authorLink(post.author,post.user_id,post.has_avatar,post.author_tags)} · ${date(post.created)}</div><div class="post-tags">${tagBadges(post.tags)}</div><div class="article-body">${esc(post.body)}</div>${canEdit(post) ? '<div class="post-actions"><button class="text-link" id="edit-post">Beitrag bearbeiten</button><button class="delete-button" id="delete-post">Beitrag löschen</button></div>' : ''}<section class="comments-section"><h3>${comments.length} ${comments.length === 1 ? 'Antwort' : 'Antworten'}</h3>${comments.map(c => `<article class="comment"><div class="article-info">${authorLink(c.author,c.user_id,c.has_avatar,c.author_tags)} · ${date(c.created)}</div><p class="comment-body">${esc(c.body)}</p>${canEdit(c) ? `<button class="text-link" data-edit-comment="${c.id}">Antwort bearbeiten</button>` : ''}</article>`).join('') || '<p class="modal-subtitle">Noch keine Antworten.</p>'}${canWrite() && (post.kind==='blog' || post.allow_replies) ? '<form id="comment-form" class="editor-form"><label>Deine Antwort<textarea name="body" required minlength="2" maxlength="5000" rows="3" placeholder="Deine Gedanken dazu …"></textarea></label><p class="form-error" role="alert"></p><button type="submit" class="button primary small">Antwort senden →</button></form>' : canWrite() ? '<p class="modal-subtitle">In diesem Themenbereich sind neue Antworten nicht erlaubt.</p>' : '<p class="auth-switch">Lesen ist öffentlich. <button data-action="login">Anmelden</button>, um mitzureden.</p>'}</section>`;
+    $('#modal-content').innerHTML = `<span class="badge ${post.kind}">${post.kind === 'blog' ? 'BLOG' : 'FORUM'} · ${esc(categories[post.category])}</span><h2 class="modal-title">${esc(post.title)}</h2><div class="article-info">${authorLink(post.author,post.user_id,post.has_avatar,post.author_tags)} · ${date(post.created)}</div><div class="post-tags">${tagBadges(post.tags)}</div><div class="article-body">${esc(post.body)}</div>${postImages(post)}${canEdit(post) ? '<div class="post-actions"><button class="text-link" id="edit-post">Beitrag bearbeiten</button><button class="delete-button" id="delete-post">Beitrag löschen</button></div>' : ''}<section class="comments-section"><h3>${comments.length} ${comments.length === 1 ? 'Antwort' : 'Antworten'}</h3>${comments.map(c => `<article class="comment"><div class="article-info">${authorLink(c.author,c.user_id,c.has_avatar,c.author_tags)} · ${date(c.created)}</div><p class="comment-body">${esc(c.body)}</p>${canEdit(c) ? `<button class="text-link" data-edit-comment="${c.id}">Antwort bearbeiten</button>` : ''}</article>`).join('') || '<p class="modal-subtitle">Noch keine Antworten.</p>'}${canWrite() && (post.kind==='blog' || post.allow_replies) ? '<form id="comment-form" class="editor-form"><label>Deine Antwort<textarea name="body" required minlength="2" maxlength="5000" rows="3" placeholder="Deine Gedanken dazu …"></textarea></label><p class="form-error" role="alert"></p><button type="submit" class="button primary small">Antwort senden →</button></form>' : canWrite() ? '<p class="modal-subtitle">In diesem Themenbereich sind neue Antworten nicht erlaubt.</p>' : '<p class="auth-switch">Lesen ist öffentlich. <button data-action="login">Anmelden</button>, um mitzureden.</p>'}</section>`;
     $('#edit-post')?.addEventListener('click',() => compose(post));
     for (const button of document.querySelectorAll('[data-edit-comment]')) button.onclick = () => editComment(comments.find(c => c.id === Number(button.dataset.editComment)),id);
     $('#comment-form')?.addEventListener('submit',async event => {

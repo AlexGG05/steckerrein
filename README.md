@@ -30,6 +30,14 @@ Name und Beschreibung eines Bereichs können geändert werden, ohne vorhandene L
 
 Profilbilder können als PNG, JPEG oder WebP mit höchstens 1 MB und 4 Megapixeln hochgeladen und wieder entfernt werden. Das Backend decodiert das Bild, schneidet es quadratisch auf 256 × 256 Pixel zu und speichert neue PNG-Pixeldaten ohne Metadaten direkt in SQLite. SVG, HTML und ungültige Bilder werden abgelehnt. Datenbank-Backups enthalten damit auch die Profilbilder; ein zusätzliches Upload-Volume ist nicht nötig.
 
+## Bilder in Beiträgen
+
+Beim Erstellen oder Bearbeiten eines Forum-Beitrags oder Blogartikels können bis zu **fünf JPG-/PNG-Bilder mit jeweils höchstens 5 MB und 16 Megapixeln** ausgewählt werden. Die Vorschau zeigt die ausgewählten und bereits gespeicherten Bilder; „Bild entfernen“ wirkt erst nach dem Speichern. Autoren oder Administratoren dürfen Bilder hinzufügen, behalten oder entfernen. Andere Mitglieder können fremde Anhänge nicht ändern oder an eigene Beiträge übernehmen.
+
+Im Beitrag erscheinen die Bilder direkt; ein Klick öffnet die größere Ansicht in einem neuen Tab. Die Beitragsübersicht zeigt eine Bildvorschau. Bilder sind wie die Beiträge öffentlich sichtbar, auch ohne Anmeldung. Bitte vor dem Hochladen selbst sichtbare Zugangsdaten oder persönliche Informationen auf Screenshots entfernen.
+
+Das Backend decodiert und validiert die Bilder, korrigiert die Orientierung, entfernt Metadaten und speichert neue JPG-/PNG-Dateien mit höchstens 2560 Pixeln Seitenlänge. SVG, WebP und ungültige Dateien sind für Beitragsanhänge nicht zugelassen. Bilder liegen direkt in der SQLite-Datenbank und sind daher im bestehenden Datenbank-Volume und dessen Sicherungen enthalten. Das Löschen eines Beitrags entfernt auch seine Bilder; eine fehlgeschlagene Bearbeitung lässt vorhandene Bilder unverändert. Reverse-Proxys müssen für Bildbeiträge JSON-Anfragen bis 36 MB zulassen, damit fünf Bilder samt Base64-Kodierung übertragen werden können.
+
 ## Adminbereich und Tags
 
 Verifizierte Administratoren erreichen über **Adminbereich** in der Navigation oder direkt unter `/admin` die Verwaltung:
@@ -120,7 +128,7 @@ node --check script.js
 docker compose up -d --build
 ```
 
-19 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
+22 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte, Beitragsbilder und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
 
 ## Daten und Betrieb
 
@@ -132,7 +140,7 @@ docker compose exec steckerrein python -c "import sqlite3; src=sqlite3.connect('
 
 Die Datei danach außerhalb des Volumes aufbewahren; Wiederherstellung separat prüfen. Der Python-HTTP-Server ist für eine kleine Community hinter dem Reverse Proxy vorgesehen. Client-IP-Rate-Limits zusätzlich am vertrauenswürdigen Proxy setzen; die Anwendung vertraut keinen frei gesetzten Forwarded-IP-Headern.
 
-Noch nicht enthalten: Passwort-Wiederherstellung, Dateianhänge an Beiträgen oder Beitragsbenachrichtigungen. Beiträge verwenden Klartext mit Absätzen, kein HTML. Die unveränderte Datenschutzerklärung muss vor öffentlichem Betrieb auf Benutzerkonten, E-Mail-Verifizierung, Sitzungen, öffentliche Profile/Profilbilder und öffentliche Beiträge geprüft werden.
+Noch nicht enthalten: Passwort-Wiederherstellung, andere Dateianhänge als JPG/PNG oder Beitragsbenachrichtigungen. Beiträge verwenden Klartext mit Absätzen, kein HTML. Die unveränderte Datenschutzerklärung muss vor öffentlichem Betrieb auf Benutzerkonten, E-Mail-Verifizierung, Sitzungen, öffentliche Profile/Profilbilder und öffentliche Beiträge geprüft werden.
 
 ## Docker-Build in der verwalteten Cloud-Umgebung
 

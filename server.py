@@ -73,6 +73,8 @@ def initialize():
             db.execute('ALTER TABLE topics ADD COLUMN allow_replies INTEGER NOT NULL DEFAULT 1 CHECK(allow_replies IN (0,1))')
             db.execute('UPDATE topics SET allow_replies=allow_posts')
         db.executescript("""
+        CREATE TABLE IF NOT EXISTS post_images(id INTEGER PRIMARY KEY, token TEXT NOT NULL UNIQUE, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, mime TEXT NOT NULL, data BLOB NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, position INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS post_images_post ON post_images(post_id,position);
         CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('post','user')), name TEXT NOT NULL COLLATE NOCASE, color TEXT NOT NULL, UNIQUE(kind,name));
         CREATE TABLE IF NOT EXISTS post_tags(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(post_id,tag_id));
         CREATE TABLE IF NOT EXISTS user_tags(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(user_id,tag_id));
@@ -171,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','strict-origin-when-cross-origin')
         self.send_header('X-Frame-Options','DENY')
-        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
+        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'")
 
     def user(self, db):
         cookie = SimpleCookie()
@@ -197,7 +199,8 @@ class Handler(BaseHTTPRequestHandler):
         if origin and urlsplit(origin).netloc != self.headers.get('Host'): raise APIError(403,'Ungültiger Ursprung.')
         try:
             length = int(self.headers.get('Content-Length','0'))
-            maximum=1500000 if urlsplit(self.path).path=='/api/profile' else 40000
+            path=urlsplit(self.path).path
+            maximum=36000000 if path=='/api/posts' or re.fullmatch(r'/api/posts/\d+',path) else 1500000 if path=='/api/profile' else 40000
             if not 0 < length <= maximum: raise ValueError()
             data = json.loads(self.rfile.read(length))
             if not isinstance(data,dict): raise ValueError()
@@ -214,6 +217,14 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path.startswith('/api/'):
             return self.dispatch('GET')
+        media=re.fullmatch(r'/media/([a-f0-9]{32})',path)
+        if media:
+            with connect() as db: picture=db.execute('SELECT mime,data FROM post_images WHERE token=?',(media[1],)).fetchone()
+            if not picture: return self.respond(404,{'error':'Bild nicht gefunden.'})
+            self.send_response(200);self.headers_common()
+            self.send_header('Content-Type',picture['mime']);self.send_header('Cache-Control','no-store')
+            self.send_header('Content-Disposition','inline');self.send_header('Content-Length',str(len(picture['data'])))
+            self.end_headers();self.wfile.write(picture['data']);return
         files = {'/':'index.html','/index.html':'index.html','/style.css':'style.css','/script.js':'script.js','/impressum.html':'impressum.html','/datenschutz.html':'datenschutz.html'}
         filename = files.get(path)
         if path in ('/forum','/blog','/admin') or re.fullmatch(r'/forum/[a-z0-9-]+|/posts/\d+|/users/[A-Za-z0-9_-]+',path): filename='index.html'
@@ -298,13 +309,53 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,OSError,binascii.Error,UnidentifiedImageError,Image.DecompressionBombError,Image.DecompressionBombWarning):
             raise APIError(400,'Bitte lade ein gültiges PNG-, JPEG- oder WebP-Bild mit höchstens 1 MB und 4 Megapixeln hoch.')
 
+    def save_post_images(self, db, post_id, images):
+        if not isinstance(images,list) or len(images)>5: raise APIError(400,'Du kannst höchstens fünf Bilder pro Beitrag hinzufügen.')
+        retained=[]
+        for position,item in enumerate(images):
+            if not isinstance(item,dict): raise APIError(400,'Ungültige Bildauswahl.')
+            if 'token' in item:
+                token=item['token']
+                if not isinstance(token,str) or token in retained or not db.execute('SELECT 1 FROM post_images WHERE token=? AND post_id=?',(token,post_id)).fetchone():
+                    raise APIError(400,'Dieses Bild gehört nicht zu diesem Beitrag.')
+                db.execute('UPDATE post_images SET position=? WHERE token=?',(position,token))
+            else:
+                encoded=item.get('data')
+                if not isinstance(encoded,str) or len(encoded)>7000000: raise APIError(400,'Bilder dürfen jeweils höchstens 5 MB groß sein.')
+                try:
+                    raw=base64.b64decode(encoded,validate=True)
+                    if not raw or len(raw)>5*1024*1024: raise ValueError()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('error',Image.DecompressionBombWarning)
+                        with Image.open(io.BytesIO(raw)) as image:
+                            if image.format not in ('JPEG','PNG') or image.width*image.height>16000000: raise ValueError()
+                            format=image.format
+                            image.load()
+                            clean=ImageOps.exif_transpose(image)
+                            clean=clean.convert('RGBA' if format=='PNG' and ('A' in clean.getbands() or 'transparency' in clean.info) else 'RGB')
+                            clean.thumbnail((2560,2560),Image.Resampling.LANCZOS)
+                            clean.info.clear();output=io.BytesIO()
+                            if format=='JPEG': clean.save(output,format='JPEG',quality=90,optimize=True)
+                            else: clean.save(output,format='PNG',optimize=True)
+                            content=output.getvalue()
+                            if len(content)>6*1024*1024: raise ValueError()
+                            width,height=clean.size
+                except (ValueError,OSError,binascii.Error,UnidentifiedImageError,Image.DecompressionBombError,Image.DecompressionBombWarning):
+                    raise APIError(400,'Bitte verwende gültige JPG- oder PNG-Bilder mit jeweils höchstens 5 MB und 16 Megapixeln.')
+                token=secrets.token_hex(16)
+                db.execute('INSERT INTO post_images(token,post_id,mime,data,width,height,position) VALUES(?,?,?,?,?,?,?)',(token,post_id,'image/jpeg' if format=='JPEG' else 'image/png',content,width,height,position))
+            retained.append(token)
+        for row in db.execute('SELECT token FROM post_images WHERE post_id=?',(post_id,)).fetchall():
+            if row['token'] not in retained: db.execute('DELETE FROM post_images WHERE token=?',(row['token'],))
+
     def tags_for(self, db, kind, item_id):
         if item_id is None: return []
         table,column=('post_tags','post_id') if kind=='post' else ('user_tags','user_id')
         return [dict(r) for r in db.execute(f'SELECT t.id,t.kind,t.name,t.color FROM tags t JOIN {table} m ON m.tag_id=t.id WHERE m.{column}=? ORDER BY t.name',(item_id,))]
 
     def post_data(self, db, row):
-        return {**dict(row),'tags':self.tags_for(db,'post',row['id']),'author_tags':self.tags_for(db,'user',row['user_id'])}
+        images=[{**dict(r),'url':'/media/'+r['token']} for r in db.execute('SELECT token,mime,width,height FROM post_images WHERE post_id=? ORDER BY position,id',(row['id'],))]
+        return {**dict(row),'tags':self.tags_for(db,'post',row['id']),'author_tags':self.tags_for(db,'user',row['user_id']),'images':images}
 
     def assign_tags(self, db, kind, item_id, tag_ids):
         if not isinstance(tag_ids,list) or len(tag_ids)>10 or any(type(i) is not int or i<1 for i in tag_ids) or len(set(tag_ids))!=len(tag_ids):
@@ -395,6 +446,8 @@ class Handler(BaseHTTPRequestHandler):
             comments=db.execute('SELECT c.id,c.body,c.created,c.user_id,(u.avatar IS NOT NULL) AS has_avatar,u.username AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created,c.id',(match[1],)).fetchall()
             return self.respond(200,{'post':self.post_data(db,post),'comments':[{**dict(c),'author_tags':self.tags_for(db,'user',c['user_id'])} for c in comments]})
         if method not in ('POST','DELETE','PATCH'): raise APIError(404,'Nicht gefunden.')
+        if path=='/api/posts' or re.fullmatch(r'/api/posts/\d+',path):
+            self.require_user(db)  # Reject unauthenticated uploads before reading a large body.
         data=self.body()
         if method=='POST' and path=='/api/verify-email':
             self.rate_limit(db, 'verify', 30)
@@ -559,6 +612,7 @@ class Handler(BaseHTTPRequestHandler):
             title=self.field(data,'title',5,140); body=self.field(data,'body',20,15000)
             result=db.execute('INSERT INTO posts(kind,category,title,body,user_id,created) VALUES(?,?,?,?,?,?)',(kind,category,title,body,user['id'],int(time.time())))
             self.assign_tags(db,'post',result.lastrowid,data.get('tag_ids',[]))
+            self.save_post_images(db,result.lastrowid,data.get('images',[]))
             db.commit()
             return self.respond(201,{'id':result.lastrowid})
         comment=re.fullmatch(r'/api/posts/(\d+)/comments',path)
@@ -595,6 +649,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise APIError(403,'Im gewählten Zielbereich sind keine Beiträge erlaubt.')
             db.execute('UPDATE posts SET title=?,body=?,category=? WHERE id=?',(title,body,category,match[1]))
             if 'tag_ids' in data: self.assign_tags(db,'post',int(match[1]),data['tag_ids'])
+            if 'images' in data: self.save_post_images(db,int(match[1]),data['images'])
             db.commit()
             return self.respond(200,{'ok':True})
         if method=='DELETE' and match:

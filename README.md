@@ -14,13 +14,13 @@ Vier Themenbereiche (Allgemein, IT & Homelab, 3D-Druck, Projekte & Builds) und d
 
 In der Forum-Übersicht können Administratoren über „Bearbeiten“ und „Löschen“ die Bereiche verwalten. Innerhalb eines Bereichs stehen „Bereich bearbeiten“, „Bereich löschen“ und „＋ Unterthema“ bereit. Der übergeordnete Bereich lässt sich sowohl beim Erstellen als auch beim Bearbeiten auswählen. Eigene Unterbereiche können nicht als Eltern ausgewählt werden; das Backend verhindert auch direkte oder indirekte Hierarchieschleifen.
 
-Die Einstellung **„Beiträge und Antworten in diesem Bereich erlauben“** gilt jeweils für den ausgewählten Bereich, unabhängig von der Freigabe seiner Unterthemen. Beispiel:
+Die Einstellungen **„Neue Beiträge in diesem Bereich erlauben“** und **„Antworten auf bestehende Beiträge erlauben“** sind unabhängig. Beide gelten jeweils für den ausgewählten Bereich, unabhängig von seinen Unterthemen. Für einen Tagwunsch- oder Ankündigungsbereich neue Beiträge ausschalten und Antworten einschalten: Mitglieder können dann ausschließlich unter bestehenden Beiträgen antworten. Beispiel:
 
 - **Hardware**: Beiträge nicht erlaubt, dient als Übersicht.
 - **Hardware / 3D-Druck**: Beiträge erlaubt, Mitglieder erstellen hier ihre Beiträge.
 - **Hardware / Homelab**: Beiträge erlaubt.
 
-Neue Oberthemen sind standardmäßig für neue Beiträge gesperrt, neue Unterthemen standardmäßig freigegeben. Bereits vorhandene Bereiche bleiben beim Update in ihrer bisherigen Schreibfreigabe erhalten; diese lässt sich anschließend gezielt ändern. Vorhandene Beiträge bleiben beim Sperren lesbar und durch ihre Autoren oder Administratoren bearbeitbar; neue Beiträge und Antworten werden auch bei direkten API-Aufrufen abgelehnt. Blogartikel sind unabhängig von der Forum-Schreibfreigabe redaktionell verwaltbar.
+Neue Oberthemen sind standardmäßig für neue Beiträge gesperrt, neue Unterthemen standardmäßig freigegeben. Bereits vorhandene Bereiche übernehmen beim Update ihre bisherige Freigabe für beide Schalter; diese lässt sich anschließend gezielt ändern. Vorhandene Beiträge bleiben beim Sperren lesbar und durch ihre Autoren oder Administratoren bearbeitbar; neue Beiträge bzw. Antworten werden entsprechend dem jeweiligen Schalter auch bei direkten API-Aufrufen abgelehnt. Blogartikel sind unabhängig von der Forum-Schreibfreigabe redaktionell verwaltbar.
 
 Name und Beschreibung eines Bereichs können geändert werden, ohne vorhandene Links zu ändern. Ein leerer Bereich kann nach Bestätigung gelöscht werden. Enthält er Beiträge oder Blogartikel, muss ein anderer, für Beiträge freigegebener Zielbereich ausgewählt werden: Die Inhalte einschließlich Antworten und Autoren werden in einer Transaktion erhalten und verschoben. Bereiche mit Unterthemen können erst nach dem Umhängen oder Entfernen ihrer Unterthemen gelöscht werden. Ein gelöschter Standardbereich wird bei einem Neustart nicht wieder angelegt.
 
@@ -120,7 +120,7 @@ node --check script.js
 docker compose up -d --build
 ```
 
-18 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
+19 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
 
 ## Daten und Betrieb
 

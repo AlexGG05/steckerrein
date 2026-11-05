@@ -69,6 +69,9 @@ def initialize():
             db.execute('ALTER TABLE topics ADD COLUMN parent_slug TEXT REFERENCES topics(slug)')
         if 'allow_posts' not in topic_columns:
             db.execute('ALTER TABLE topics ADD COLUMN allow_posts INTEGER NOT NULL DEFAULT 1 CHECK(allow_posts IN (0,1))')
+        if 'allow_replies' not in topic_columns:
+            db.execute('ALTER TABLE topics ADD COLUMN allow_replies INTEGER NOT NULL DEFAULT 1 CHECK(allow_replies IN (0,1))')
+            db.execute('UPDATE topics SET allow_replies=allow_posts')
         db.executescript("""
         CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('post','user')), name TEXT NOT NULL COLLATE NOCASE, color TEXT NOT NULL, UNIQUE(kind,name));
         CREATE TABLE IF NOT EXISTS post_tags(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(post_id,tag_id));
@@ -318,6 +321,8 @@ class Handler(BaseHTTPRequestHandler):
         if type(allowed) is not bool: raise APIError(400,'Bitte lege fest, ob Beiträge erlaubt sind.')
         if parent is not None and (not isinstance(parent,str) or not db.execute('SELECT 1 FROM topics WHERE slug=?',(parent,)).fetchone()):
             raise APIError(400,'Übergeordneter Themenbereich nicht gefunden.')
+        replies=data.get('allow_replies',bool(topic['allow_replies']) if topic else allowed)
+        if type(replies) is not bool: raise APIError(400,'Bitte lege fest, ob Antworten erlaubt sind.')
         current=parent
         seen=set()
         while current is not None:
@@ -326,7 +331,7 @@ class Handler(BaseHTTPRequestHandler):
             seen.add(current)
             row=db.execute('SELECT parent_slug FROM topics WHERE slug=?',(current,)).fetchone()
             current=row['parent_slug'] if row else None
-        return parent,allowed
+        return parent,allowed,replies
 
     def api(self, db, method):
         parsed = urlsplit(self.path)
@@ -385,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200,{'posts':[self.post_data(db,r) for r in rows],'total':count,'stats':stats})
         match=re.fullmatch(r'/api/posts/(\d+)',path)
         if method=='GET' and match:
-            post=db.execute("SELECT p.*,(u.avatar IS NOT NULL) AS has_avatar,COALESCE(u.username,'Redaktion') AS author FROM posts p LEFT JOIN users u ON u.id=p.user_id WHERE p.id=?",(match[1],)).fetchone()
+            post=db.execute("SELECT p.*,(u.avatar IS NOT NULL) AS has_avatar,COALESCE(u.username,'Redaktion') AS author,t.allow_replies FROM posts p LEFT JOIN users u ON u.id=p.user_id JOIN topics t ON t.slug=p.category WHERE p.id=?",(match[1],)).fetchone()
             if not post: raise APIError(404,'Beitrag nicht gefunden.')
             comments=db.execute('SELECT c.id,c.body,c.created,c.user_id,(u.avatar IS NOT NULL) AS has_avatar,u.username AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created,c.id',(match[1],)).fetchall()
             return self.respond(200,{'post':self.post_data(db,post),'comments':[{**dict(c),'author_tags':self.tags_for(db,'user',c['user_id'])} for c in comments]})
@@ -507,9 +512,9 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('BEGIN IMMEDIATE')
             name=self.field(data,'name',3,80)
             description=self.field(data,'description',10,300)
-            parent,allowed=self.topic_settings(db,data)
+            parent,allowed,replies=self.topic_settings(db,data)
             slug=secrets.token_hex(8)
-            try: db.execute('INSERT INTO topics(slug,name,description,parent_slug,allow_posts) VALUES(?,?,?,?,?)',(slug,name,description,parent,int(allowed)))
+            try: db.execute('INSERT INTO topics(slug,name,description,parent_slug,allow_posts,allow_replies) VALUES(?,?,?,?,?,?)',(slug,name,description,parent,int(allowed),int(replies)))
             except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
             db.commit()
             return self.respond(201,{'slug':slug})
@@ -524,8 +529,8 @@ class Handler(BaseHTTPRequestHandler):
             if method=='PATCH':
                 name=self.field(data,'name',3,80)
                 description=self.field(data,'description',10,300)
-                parent,allowed=self.topic_settings(db,data,topic)
-                try: db.execute('UPDATE topics SET name=?,description=?,parent_slug=?,allow_posts=? WHERE slug=?',(name,description,parent,int(allowed),slug))
+                parent,allowed,replies=self.topic_settings(db,data,topic)
+                try: db.execute('UPDATE topics SET name=?,description=?,parent_slug=?,allow_posts=?,allow_replies=? WHERE slug=?',(name,description,parent,int(allowed),int(replies),slug))
                 except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
                 db.commit()
                 return self.respond(200,{'slug':slug})
@@ -559,9 +564,9 @@ class Handler(BaseHTTPRequestHandler):
         comment=re.fullmatch(r'/api/posts/(\d+)/comments',path)
         if method=='POST' and comment:
             db.execute('BEGIN IMMEDIATE')
-            parent_post=db.execute('SELECT p.kind,t.allow_posts FROM posts p JOIN topics t ON t.slug=p.category WHERE p.id=?',(comment[1],)).fetchone()
+            parent_post=db.execute('SELECT p.kind,t.allow_replies FROM posts p JOIN topics t ON t.slug=p.category WHERE p.id=?',(comment[1],)).fetchone()
             if not parent_post: raise APIError(404,'Beitrag nicht gefunden.')
-            if parent_post['kind']=='forum' and not parent_post['allow_posts']: raise APIError(403,'In diesem Themenbereich sind keine neuen Antworten erlaubt.')
+            if parent_post['kind']=='forum' and not parent_post['allow_replies']: raise APIError(403,'In diesem Themenbereich sind keine neuen Antworten erlaubt.')
             body=self.field(data,'body',2,5000)
             db.execute('INSERT INTO comments(post_id,user_id,body,created) VALUES(?,?,?,?)',(comment[1],user['id'],body,int(time.time())))
             db.commit()

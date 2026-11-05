@@ -241,10 +241,10 @@ class CommunityTest(unittest.TestCase):
         admin,admin_user=self.register('hierarchyadmin'); member,_=self.register('hierarchymember')
         with server.connect() as db: db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
         def create(name,parent=None,allowed=False):
-            status,value,_=self.request('/api/topics','POST',{'name':name,'description':'Ein Bereich für gemeinsame Projekte.','parent_slug':parent,'allow_posts':allowed},admin)
+            status,value,_=self.request('/api/topics','POST',{'name':name,'description':'Ein Bereich für gemeinsame Projekte.','parent_slug':parent,'allow_posts':allowed,'allow_replies':allowed},admin)
             self.assertEqual(status,201,value);return value['slug']
         root=create('Hardware Oberthema');child=create('Server Unterthema',root,True);target=create('Ersatz Unterthema',root,True)
-        def setting(name,parent,allowed):return {'name':name,'description':'Eine aktualisierte Beschreibung.','parent_slug':parent,'allow_posts':allowed}
+        def setting(name,parent,allowed):return {'name':name,'description':'Eine aktualisierte Beschreibung.','parent_slug':parent,'allow_posts':allowed,'allow_replies':allowed}
         for method in ('PATCH','DELETE'):
             self.assertEqual(self.request('/api/topics/'+root,method,{},None)[0],401)
             self.assertEqual(self.request('/api/topics/'+root,method,{},member)[0],403)
@@ -388,5 +388,28 @@ class CommunityTest(unittest.TestCase):
         self.assertEqual(self.request('/api/admin/users/999999/tags','PATCH',{'tag_ids':[]},admin)[0],404)
         server.initialize()
         self.assertNotIn(tag,[t['id'] for t in self.request('/api/tags')[1]['tags']])
+
+    def test_19_replies_independent_of_new_posts(self):
+        admin,admin_user=self.register('replyadmin');member,_=self.register('replymember')
+        with server.connect() as db:db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
+        settings={'name':'Tagwünsche','description':'Hier können Mitglieder gewünschte Tags vorschlagen.','allow_posts':True,'allow_replies':True}
+        status,result,_=self.request('/api/topics','POST',settings,admin);self.assertEqual(status,201);slug=result['slug']
+        post={'title':'Welche Tags wünscht ihr euch?','body':'Bitte antwortet hier mit euren gewünschten Tags.','category':slug}
+        status,result,_=self.request('/api/posts','POST',post,admin);self.assertEqual(status,201);pid=result['id']
+        self.assertEqual(self.request('/api/topics/'+slug,'PATCH',{**settings,'allow_posts':False},admin)[0],200)
+        self.assertEqual(self.request('/api/posts','POST',post,member)[0],403)
+        self.assertEqual(self.request('/api/posts/'+str(pid)+'/comments','POST',{'body':'Ich wünsche mir einen Druckermodell-Tag.'})[0],401)
+        self.assertEqual(self.request('/api/posts/'+str(pid)+'/comments','POST',{'body':'Ich wünsche mir einen Druckermodell-Tag.'},member)[0],201)
+        detail=self.request('/api/posts/'+str(pid))[1];self.assertEqual(detail['post']['allow_replies'],1)
+        self.assertEqual(self.request('/api/topics/'+slug,'PATCH',{**settings,'allow_posts':True,'allow_replies':False},admin)[0],200)
+        self.assertEqual(self.request('/api/posts/'+str(pid)+'/comments','POST',{'body':'Noch ein Wunsch'},member)[0],403)
+        self.assertEqual(self.request('/api/posts','POST',post,member)[0],201)
+        self.assertEqual(len(self.request('/api/posts/'+str(pid))[1]['comments']),1)
+        self.assertEqual(self.request('/api/topics/'+slug,'PATCH',{**settings,'allow_replies':'yes'},admin)[0],400)
+        # Older clients that omit the new setting must not silently change it.
+        self.assertEqual(self.request('/api/topics/'+slug,'PATCH',{'name':settings['name'],'description':settings['description'],'allow_posts':False},admin)[0],200)
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['allow_replies'],0)
+        server.initialize()
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['allow_replies'],0)
 
 if __name__=='__main__':unittest.main()

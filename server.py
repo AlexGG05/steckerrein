@@ -1,5 +1,10 @@
 """Dependency-free community server. Run with Python 3.12+."""
 import argparse
+import base64
+import binascii
+import io
+import warnings
+from PIL import Image, ImageOps, UnidentifiedImageError
 import hashlib
 import hmac
 import json
@@ -23,6 +28,7 @@ CATEGORIES = {'allgemein': 'Allgemein', 'it': 'IT & Homelab', '3d-druck': '3D-Dr
 SESSION_TTL = 7 * 86400
 VERIFY_TTL = 24 * 3600
 RATE_LOCK = threading.Lock()
+TAG_COLORS = {'green','purple','blue','orange','red','gray'}
 
 def connect():
     db = sqlite3.connect(DB, timeout=10)
@@ -50,16 +56,32 @@ def initialize():
             db.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0')
             # Existing accounts must verify as well. Revoke pre-migration sessions.
             db.execute('DELETE FROM sessions')
+        for name,definition in (('display_name',"TEXT NOT NULL DEFAULT ''"),('bio',"TEXT NOT NULL DEFAULT ''"),('website',"TEXT NOT NULL DEFAULT ''"),('avatar','BLOB')):
+            if name not in columns: db.execute(f'ALTER TABLE users ADD COLUMN {name} {definition}')
         db.executescript("""
         CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email) WHERE email IS NOT NULL;
         CREATE TABLE IF NOT EXISTS email_tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL, sent INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS rate_limits(bucket TEXT NOT NULL, subject TEXT NOT NULL, started INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(bucket,subject));
         """)
         db.execute('CREATE TABLE IF NOT EXISTS topics(slug TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT NOT NULL)')
+        topic_columns={r['name'] for r in db.execute('PRAGMA table_info(topics)')}
+        if 'parent_slug' not in topic_columns:
+            db.execute('ALTER TABLE topics ADD COLUMN parent_slug TEXT REFERENCES topics(slug)')
+        if 'allow_posts' not in topic_columns:
+            db.execute('ALTER TABLE topics ADD COLUMN allow_posts INTEGER NOT NULL DEFAULT 1 CHECK(allow_posts IN (0,1))')
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('post','user')), name TEXT NOT NULL COLLATE NOCASE, color TEXT NOT NULL, UNIQUE(kind,name));
+        CREATE TABLE IF NOT EXISTS post_tags(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(post_id,tag_id));
+        CREATE TABLE IF NOT EXISTS user_tags(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY(user_id,tag_id));
+        """)
+        if not db.execute("SELECT 1 FROM metadata WHERE key='tags_initialized'").fetchone():
+            db.execute("INSERT OR IGNORE INTO tags(kind,name,color) VALUES('post','Offen','orange')")
+            db.execute("INSERT OR IGNORE INTO tags(kind,name,color) VALUES('post','Gelöst','green')")
+            db.execute("INSERT INTO metadata VALUES('tags_initialized','1')")
         if not db.execute("SELECT 1 FROM metadata WHERE key='topics_initialized'").fetchone():
             descriptions={'it':'Server, Netzwerke, Software und dein eigenes Homelab.', '3d-druck':'Drucker, Filamente, Slicer und Hilfe beim nächsten Druck.', 'projekte':'Zeig deine Builds und entwickle gemeinsam neue Ideen.', 'allgemein':'Vorstellen, austauschen und über den Tellerrand schauen.'}
             for slug,name in CATEGORIES.items():
-                db.execute('INSERT OR IGNORE INTO topics VALUES(?,?,?)',(slug,name,descriptions[slug]))
+                db.execute('INSERT OR IGNORE INTO topics(slug,name,description) VALUES(?,?,?)',(slug,name,descriptions[slug]))
             db.execute("INSERT INTO metadata VALUES('topics_initialized','1')")
         if not db.execute("SELECT 1 FROM metadata WHERE key='initialized'").fetchone():
             articles = [
@@ -155,7 +177,7 @@ class Handler(BaseHTTPRequestHandler):
         token = cookie.get('session')
         if not token: return None
         hashed = hashlib.sha256(token.value.encode()).hexdigest()
-        return db.execute('SELECT u.id,u.username,u.admin,u.email_verified FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?', (hashed,int(time.time()))).fetchone()
+        return db.execute('SELECT u.id,u.username,u.admin,u.email_verified,(u.avatar IS NOT NULL) AS has_avatar FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?', (hashed,int(time.time()))).fetchone()
 
     def require_user(self, db):
         user = self.user(db)
@@ -172,7 +194,8 @@ class Handler(BaseHTTPRequestHandler):
         if origin and urlsplit(origin).netloc != self.headers.get('Host'): raise APIError(403,'Ungültiger Ursprung.')
         try:
             length = int(self.headers.get('Content-Length','0'))
-            if not 0 < length <= 40000: raise ValueError()
+            maximum=1500000 if urlsplit(self.path).path=='/api/profile' else 40000
+            if not 0 < length <= maximum: raise ValueError()
             data = json.loads(self.rfile.read(length))
             if not isinstance(data,dict): raise ValueError()
             return data
@@ -190,7 +213,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.dispatch('GET')
         files = {'/':'index.html','/index.html':'index.html','/style.css':'style.css','/script.js':'script.js','/impressum.html':'impressum.html','/datenschutz.html':'datenschutz.html'}
         filename = files.get(path)
-        if path in ('/forum','/blog') or re.fullmatch(r'/forum/[a-z0-9-]+|/posts/\d+',path): filename='index.html'
+        if path in ('/forum','/blog','/admin') or re.fullmatch(r'/forum/[a-z0-9-]+|/posts/\d+|/users/[A-Za-z0-9_-]+',path): filename='index.html'
         if not filename: return self.respond(404,{'error':'Seite nicht gefunden.'})
         data = (ROOT/filename).read_bytes()
         mime = {'.html':'text/html','.css':'text/css','.js':'text/javascript'}[Path(filename).suffix]
@@ -253,12 +276,94 @@ class Handler(BaseHTTPRequestHandler):
             db.commit()
             raise
 
+    def avatar(self, encoded):
+        if not isinstance(encoded,str) or len(encoded)>1400000: raise APIError(400,'Profilbilder dürfen höchstens 1 MB groß sein.')
+        try:
+            raw=base64.b64decode(encoded,validate=True)
+            if not raw or len(raw)>1048576: raise ValueError()
+            with warnings.catch_warnings():
+                warnings.simplefilter('error',Image.DecompressionBombWarning)
+                with Image.open(io.BytesIO(raw)) as image:
+                    if image.format not in ('JPEG','PNG','WEBP') or image.width*image.height>4000000: raise ValueError()
+                    image.load()
+                    clean=ImageOps.exif_transpose(image).convert('RGBA')
+                    clean=ImageOps.fit(clean,(256,256),method=Image.Resampling.LANCZOS)
+                    clean.info.clear()
+                    # Re-encode decoded pixels; never retain uploaded metadata or files.
+                    output=io.BytesIO();clean.save(output,format='PNG')
+                    return output.getvalue()
+        except (ValueError,OSError,binascii.Error,UnidentifiedImageError,Image.DecompressionBombError,Image.DecompressionBombWarning):
+            raise APIError(400,'Bitte lade ein gültiges PNG-, JPEG- oder WebP-Bild mit höchstens 1 MB und 4 Megapixeln hoch.')
+
+    def tags_for(self, db, kind, item_id):
+        if item_id is None: return []
+        table,column=('post_tags','post_id') if kind=='post' else ('user_tags','user_id')
+        return [dict(r) for r in db.execute(f'SELECT t.id,t.kind,t.name,t.color FROM tags t JOIN {table} m ON m.tag_id=t.id WHERE m.{column}=? ORDER BY t.name',(item_id,))]
+
+    def post_data(self, db, row):
+        return {**dict(row),'tags':self.tags_for(db,'post',row['id']),'author_tags':self.tags_for(db,'user',row['user_id'])}
+
+    def assign_tags(self, db, kind, item_id, tag_ids):
+        if not isinstance(tag_ids,list) or len(tag_ids)>10 or any(type(i) is not int or i<1 for i in tag_ids) or len(set(tag_ids))!=len(tag_ids):
+            raise APIError(400,'Bitte wähle höchstens zehn unterschiedliche Tags.')
+        for tag_id in tag_ids:
+            if not db.execute('SELECT 1 FROM tags WHERE id=? AND kind=?',(tag_id,kind)).fetchone(): raise APIError(400,'Ein gewählter Tag existiert nicht oder hat die falsche Art.')
+        table,column=('post_tags','post_id') if kind=='post' else ('user_tags','user_id')
+        db.execute(f'DELETE FROM {table} WHERE {column}=?',(item_id,))
+        db.executemany(f'INSERT INTO {table}({column},tag_id) VALUES(?,?)',[(item_id,tag_id) for tag_id in tag_ids])
+
+    def topic_settings(self, db, data, topic=None):
+        parent=data.get('parent_slug',topic['parent_slug'] if topic else None)
+        allowed=data.get('allow_posts',bool(topic['allow_posts']) if topic else bool(parent))
+        if type(allowed) is not bool: raise APIError(400,'Bitte lege fest, ob Beiträge erlaubt sind.')
+        if parent is not None and (not isinstance(parent,str) or not db.execute('SELECT 1 FROM topics WHERE slug=?',(parent,)).fetchone()):
+            raise APIError(400,'Übergeordneter Themenbereich nicht gefunden.')
+        current=parent
+        seen=set()
+        while current is not None:
+            if current in seen or (topic and current==topic['slug']):
+                raise APIError(400,'Ein Themenbereich kann nicht sich selbst oder einem eigenen Unterthema untergeordnet werden.')
+            seen.add(current)
+            row=db.execute('SELECT parent_slug FROM topics WHERE slug=?',(current,)).fetchone()
+            current=row['parent_slug'] if row else None
+        return parent,allowed
+
     def api(self, db, method):
         parsed = urlsplit(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
+        if method=='GET' and path=='/api/tags':
+            rows=db.execute("SELECT t.*,(SELECT COUNT(*) FROM post_tags p WHERE p.tag_id=t.id)+(SELECT COUNT(*) FROM user_tags u WHERE u.tag_id=t.id) AS uses FROM tags t ORDER BY t.kind,t.name").fetchall()
+            return self.respond(200,{'tags':[dict(r) for r in rows]})
+        if method=='GET' and path=='/api/admin/users':
+            user=self.require_user(db)
+            if not user['admin']: raise APIError(403,'Nur Administratoren haben Zugriff auf diesen Bereich.')
+            search=query.get('q',[''])[0][:80]
+            try: page=max(1,int(query.get('page',['1'])[0]))
+            except ValueError: raise APIError(400,'Ungültige Seite.')
+            pattern='%'+search+'%'
+            rows=db.execute('SELECT id,username,display_name,admin,email_verified,created FROM users WHERE username LIKE ? OR display_name LIKE ? ORDER BY username LIMIT 50 OFFSET ?',(pattern,pattern,(page-1)*50)).fetchall()
+            count=db.execute('SELECT COUNT(*) FROM users WHERE username LIKE ? OR display_name LIKE ?',(pattern,pattern)).fetchone()[0]
+            return self.respond(200,{'users':[{**dict(r),'tags':self.tags_for(db,'user',r['id'])} for r in rows],'total':count})
         if method=='GET' and path=='/api/topics':
-            rows=db.execute("SELECT t.*,(SELECT COUNT(*) FROM posts p WHERE p.category=t.slug AND p.kind='forum') AS posts FROM topics t ORDER BY t.rowid").fetchall()
+            rows=db.execute("SELECT t.*,(SELECT COUNT(*) FROM posts p WHERE p.category=t.slug AND p.kind='forum') AS posts,(SELECT COUNT(*) FROM posts p WHERE p.category=t.slug) AS items,(SELECT COUNT(*) FROM topics child WHERE child.parent_slug=t.slug) AS children FROM topics t ORDER BY t.rowid").fetchall()
             return self.respond(200,{'topics':[dict(r) for r in rows]})
+        profile_match=re.fullmatch(r'/api/users/([A-Za-z0-9_-]+)(/avatar)?',path)
+        if method=='GET' and profile_match:
+            row=db.execute('SELECT id,username,admin,created,display_name,bio,website,avatar FROM users WHERE username=?',(profile_match[1],)).fetchone()
+            if not row: raise APIError(404,'Profil nicht gefunden.')
+            if profile_match[2]:
+                if row['avatar'] is None: raise APIError(404,'Kein Profilbild vorhanden.')
+                self.send_response(200);self.headers_common()
+                self.send_header('Content-Type','image/png')
+                self.send_header('Cache-Control','no-store')
+                self.send_header('Content-Length',str(len(row['avatar'])))
+                self.end_headers();self.wfile.write(row['avatar']);return
+            public={key:row[key] for key in ('id','username','admin','created','display_name','bio','website')}
+            public['has_avatar']=row['avatar'] is not None
+            public['tags']=self.tags_for(db,'user',row['id'])
+            public['posts']=db.execute('SELECT COUNT(*) FROM posts WHERE user_id=?',(row['id'],)).fetchone()[0]
+            public['replies']=db.execute('SELECT COUNT(*) FROM comments WHERE user_id=?',(row['id'],)).fetchone()[0]
+            return self.respond(200,{'profile':public})
         if method=='GET' and path=='/api/me':
             user=self.user(db)
             return self.respond(200,{'user':dict(user) if user else None})
@@ -269,19 +374,21 @@ class Handler(BaseHTTPRequestHandler):
             if query.get('q'):
                 clauses.append('(p.title LIKE ? OR p.body LIKE ?)')
                 values.extend(['%'+query['q'][0][:120]+'%']*2)
+            if query.get('author'):
+                clauses.append('p.user_id=(SELECT id FROM users WHERE username=?)');values.append(query['author'][0])
             where=' WHERE '+' AND '.join(clauses) if clauses else ''
             try: page=max(1,int(query.get('page',['1'])[0]))
             except ValueError: raise APIError(400,'Ungültige Seite.')
             count=db.execute('SELECT COUNT(*) FROM posts p'+where,values).fetchone()[0]
-            rows=db.execute("SELECT p.id,p.kind,p.category,p.title,substr(p.body,1,200) AS excerpt,p.created,COALESCE(u.username,'Redaktion') AS author,(SELECT COUNT(*) FROM comments c WHERE c.post_id=p.id) AS comments FROM posts p LEFT JOIN users u ON u.id=p.user_id"+where+' ORDER BY p.created DESC,p.id DESC LIMIT 12 OFFSET ?',values+[(page-1)*12]).fetchall()
+            rows=db.execute("SELECT p.id,p.kind,p.category,p.title,p.user_id,(u.avatar IS NOT NULL) AS has_avatar,substr(p.body,1,200) AS excerpt,p.created,COALESCE(u.username,'Redaktion') AS author,(SELECT COUNT(*) FROM comments c WHERE c.post_id=p.id) AS comments FROM posts p LEFT JOIN users u ON u.id=p.user_id"+where+' ORDER BY p.created DESC,p.id DESC LIMIT 12 OFFSET ?',values+[(page-1)*12]).fetchall()
             stats={'members':db.execute('SELECT COUNT(*) FROM users').fetchone()[0], 'topics':db.execute("SELECT COUNT(*) FROM posts WHERE kind='forum'").fetchone()[0], 'articles':db.execute("SELECT COUNT(*) FROM posts WHERE kind='blog'").fetchone()[0]}
-            return self.respond(200,{'posts':[dict(r) for r in rows],'total':count,'stats':stats})
+            return self.respond(200,{'posts':[self.post_data(db,r) for r in rows],'total':count,'stats':stats})
         match=re.fullmatch(r'/api/posts/(\d+)',path)
         if method=='GET' and match:
-            post=db.execute("SELECT p.*,COALESCE(u.username,'Redaktion') AS author FROM posts p LEFT JOIN users u ON u.id=p.user_id WHERE p.id=?",(match[1],)).fetchone()
+            post=db.execute("SELECT p.*,(u.avatar IS NOT NULL) AS has_avatar,COALESCE(u.username,'Redaktion') AS author FROM posts p LEFT JOIN users u ON u.id=p.user_id WHERE p.id=?",(match[1],)).fetchone()
             if not post: raise APIError(404,'Beitrag nicht gefunden.')
-            comments=db.execute('SELECT c.id,c.body,c.created,c.user_id,u.username AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created,c.id',(match[1],)).fetchall()
-            return self.respond(200,{'post':dict(post),'comments':[dict(c) for c in comments]})
+            comments=db.execute('SELECT c.id,c.body,c.created,c.user_id,(u.avatar IS NOT NULL) AS has_avatar,u.username AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created,c.id',(match[1],)).fetchall()
+            return self.respond(200,{'post':self.post_data(db,post),'comments':[{**dict(c),'author_tags':self.tags_for(db,'user',c['user_id'])} for c in comments]})
         if method not in ('POST','DELETE','PATCH'): raise APIError(404,'Nicht gefunden.')
         data=self.body()
         if method=='POST' and path=='/api/verify-email':
@@ -336,9 +443,60 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),row['id'],now+SESSION_TTL))
             db.commit()
             user={key:row[key] for key in ('id','username','admin','email_verified')}
+            user['has_avatar']=row['avatar'] is not None
             secure='; Secure' if os.environ.get('COOKIE_SECURE')=='1' else ''
             return self.respond(200,{'user':user},f'session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}')
         user=self.require_user(db)
+        tag_match=re.fullmatch(r'/api/admin/tags/(\d+)',path)
+        if (method=='POST' and path=='/api/admin/tags') or (method in ('PATCH','DELETE') and tag_match):
+            if not user['admin']: raise APIError(403,'Nur Administratoren dürfen Tags verwalten.')
+            db.execute('BEGIN IMMEDIATE')
+            existing=None
+            if tag_match:
+                existing=db.execute('SELECT * FROM tags WHERE id=?',(tag_match[1],)).fetchone()
+                if not existing: raise APIError(404,'Tag nicht gefunden.')
+            if method=='DELETE':
+                db.execute('DELETE FROM tags WHERE id=?',(existing['id'],));db.commit()
+                return self.respond(200,{'ok':True})
+            kind=existing['kind'] if existing else data.get('kind')
+            if kind not in ('post','user') or (existing and data.get('kind',kind)!=kind): raise APIError(400,'Ungültige Tag-Art.')
+            name=self.field(data,'name',1,40)
+            color=data.get('color','purple')
+            if not isinstance(color,str) or color not in TAG_COLORS: raise APIError(400,'Bitte wähle eine gültige Tag-Farbe.')
+            try:
+                if existing:
+                    db.execute('UPDATE tags SET name=?,color=? WHERE id=?',(name,color,existing['id']));tag_id=existing['id']
+                else: tag_id=db.execute('INSERT INTO tags(kind,name,color) VALUES(?,?,?)',(kind,name,color)).lastrowid
+            except sqlite3.IntegrityError: raise APIError(409,'Ein Tag mit diesem Namen existiert bereits in dieser Tag-Art.')
+            db.commit()
+            return self.respond(200 if existing else 201,{'id':tag_id})
+        user_tag_match=re.fullmatch(r'/api/admin/users/(\d+)/tags',path)
+        if method=='PATCH' and user_tag_match:
+            if not user['admin']: raise APIError(403,'Nur Administratoren dürfen Nutzertags zuweisen.')
+            db.execute('BEGIN IMMEDIATE')
+            if not db.execute('SELECT 1 FROM users WHERE id=?',(user_tag_match[1],)).fetchone(): raise APIError(404,'Mitglied nicht gefunden.')
+            self.assign_tags(db,'user',int(user_tag_match[1]),data.get('tag_ids'))
+            db.commit()
+            return self.respond(200,{'ok':True})
+        if method=='PATCH' and path=='/api/profile':
+            display_name=self.field(data,'display_name',0,60)
+            bio=self.field(data,'bio',0,1000)
+            website=self.field(data,'website',0,300)
+            if website:
+                parsed=urlsplit(website)
+                try: valid_port=parsed.port
+                except ValueError: raise APIError(400,'Ungültige Website-Adresse.')
+                if parsed.scheme not in ('https','http') or not parsed.hostname or parsed.username or parsed.password or any(c.isspace() for c in website) or any(ord(c)<32 for c in website):
+                    raise APIError(400,'Website-Adressen müssen mit https:// oder http:// beginnen und dürfen keine Zugangsdaten enthalten.')
+            if type(data.get('remove_avatar',False)) is not bool: raise APIError(400,'Ungültige Profilbildeinstellung.')
+            if data.get('avatar') and data.get('remove_avatar'): raise APIError(400,'Bitte entweder ein Bild hochladen oder das Profilbild entfernen.')
+            image=None
+            if 'avatar' in data: image=self.avatar(data['avatar'])
+            db.execute('UPDATE users SET display_name=?,bio=?,website=? WHERE id=?',(display_name,bio,website,user['id']))
+            if image is not None or data.get('remove_avatar'):
+                db.execute('UPDATE users SET avatar=? WHERE id=?',(image,user['id']))
+            db.commit()
+            return self.respond(200,{'ok':True})
         if method=='POST' and path=='/api/logout':
             cookie=SimpleCookie(self.headers.get('Cookie',''))
             db.execute('DELETE FROM sessions WHERE token=?',(hashlib.sha256(cookie['session'].value.encode()).hexdigest(),))
@@ -346,26 +504,64 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200,{'ok':True},'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0')
         if method=='POST' and path=='/api/topics':
             if not user['admin']: raise APIError(403,'Nur Administratoren dürfen Themenbereiche erstellen.')
+            db.execute('BEGIN IMMEDIATE')
             name=self.field(data,'name',3,80)
             description=self.field(data,'description',10,300)
+            parent,allowed=self.topic_settings(db,data)
             slug=secrets.token_hex(8)
-            try: db.execute('INSERT INTO topics VALUES(?,?,?)',(slug,name,description))
+            try: db.execute('INSERT INTO topics(slug,name,description,parent_slug,allow_posts) VALUES(?,?,?,?,?)',(slug,name,description,parent,int(allowed)))
             except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
             db.commit()
             return self.respond(201,{'slug':slug})
+        topic_match=re.fullmatch(r'/api/topics/([a-z0-9-]+)',path)
+        if method in ('PATCH','DELETE') and topic_match:
+            if not user['admin']: raise APIError(403,'Nur Administratoren dürfen Themenbereiche verwalten.')
+            # Serialize membership checks and moves with concurrent post creation/editing.
+            db.execute('BEGIN IMMEDIATE')
+            slug=topic_match[1]
+            topic=db.execute('SELECT * FROM topics WHERE slug=?',(slug,)).fetchone()
+            if not topic: raise APIError(404,'Themenbereich nicht gefunden.')
+            if method=='PATCH':
+                name=self.field(data,'name',3,80)
+                description=self.field(data,'description',10,300)
+                parent,allowed=self.topic_settings(db,data,topic)
+                try: db.execute('UPDATE topics SET name=?,description=?,parent_slug=?,allow_posts=? WHERE slug=?',(name,description,parent,int(allowed),slug))
+                except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
+                db.commit()
+                return self.respond(200,{'slug':slug})
+            if db.execute('SELECT 1 FROM topics WHERE parent_slug=?',(slug,)).fetchone():
+                raise APIError(409,'Dieser Bereich enthält Unterthemen. Verschiebe oder entferne zuerst die Unterthemen.')
+            count=db.execute('SELECT COUNT(*) FROM posts WHERE category=?',(slug,)).fetchone()[0]
+            target=data.get('move_to')
+            if target is not None:
+                if not isinstance(target,str) or target==slug or not db.execute('SELECT 1 FROM topics WHERE slug=? AND allow_posts=1',(target,)).fetchone():
+                    raise APIError(400,'Bitte wähle einen anderen Zielbereich, in dem Beiträge erlaubt sind.')
+            if count and target is None:
+                raise APIError(409,'Dieser Bereich enthält Beiträge oder Blogartikel. Wähle einen Zielbereich, damit alle Inhalte erhalten bleiben.')
+            if target is not None: db.execute('UPDATE posts SET category=? WHERE category=?',(target,slug))
+            db.execute('DELETE FROM topics WHERE slug=?',(slug,))
+            db.commit()
+            return self.respond(200,{'ok':True,'moved':count})
         if method=='POST' and path=='/api/posts':
+            db.execute('BEGIN IMMEDIATE')
             kind=data.get('kind','forum')
             if kind not in ('forum','blog'): raise APIError(400,'Ungültiger Beitragstyp.')
             if kind=='blog' and not user['admin']: raise APIError(403,'Blogartikel können nur von der Redaktion veröffentlicht werden.')
             category=data.get('category')
             if not isinstance(category,str) or not db.execute('SELECT 1 FROM topics WHERE slug=?',(category,)).fetchone(): raise APIError(400,'Bitte wähle eine Kategorie.')
+            if kind=='forum' and not db.execute('SELECT allow_posts FROM topics WHERE slug=?',(category,)).fetchone()['allow_posts']:
+                raise APIError(403,'In diesem Themenbereich sind keine neuen Beiträge erlaubt. Wähle ein freigegebenes Unterthema.')
             title=self.field(data,'title',5,140); body=self.field(data,'body',20,15000)
             result=db.execute('INSERT INTO posts(kind,category,title,body,user_id,created) VALUES(?,?,?,?,?,?)',(kind,category,title,body,user['id'],int(time.time())))
+            self.assign_tags(db,'post',result.lastrowid,data.get('tag_ids',[]))
             db.commit()
             return self.respond(201,{'id':result.lastrowid})
         comment=re.fullmatch(r'/api/posts/(\d+)/comments',path)
         if method=='POST' and comment:
-            if not db.execute('SELECT id FROM posts WHERE id=?',(comment[1],)).fetchone(): raise APIError(404,'Beitrag nicht gefunden.')
+            db.execute('BEGIN IMMEDIATE')
+            parent_post=db.execute('SELECT p.kind,t.allow_posts FROM posts p JOIN topics t ON t.slug=p.category WHERE p.id=?',(comment[1],)).fetchone()
+            if not parent_post: raise APIError(404,'Beitrag nicht gefunden.')
+            if parent_post['kind']=='forum' and not parent_post['allow_posts']: raise APIError(403,'In diesem Themenbereich sind keine neuen Antworten erlaubt.')
             body=self.field(data,'body',2,5000)
             db.execute('INSERT INTO comments(post_id,user_id,body,created) VALUES(?,?,?,?)',(comment[1],user['id'],body,int(time.time())))
             db.commit()
@@ -382,6 +578,7 @@ class Handler(BaseHTTPRequestHandler):
             db.commit()
             return self.respond(200,{'ok':True})
         if method=='PATCH' and match:
+            db.execute('BEGIN IMMEDIATE')
             post=db.execute('SELECT * FROM posts WHERE id=?',(match[1],)).fetchone()
             if not post: raise APIError(404,'Beitrag nicht gefunden.')
             if post['user_id']!=user['id'] and not user['admin']: raise APIError(403,'Nur Autor und Administratoren dürfen diesen Beitrag bearbeiten.')
@@ -389,7 +586,10 @@ class Handler(BaseHTTPRequestHandler):
             body=self.field(data,'body',20,15000)
             category=data.get('category')
             if not isinstance(category,str) or not db.execute('SELECT 1 FROM topics WHERE slug=?',(category,)).fetchone(): raise APIError(400,'Bitte wähle eine Kategorie.')
+            if post['kind']=='forum' and category!=post['category'] and not db.execute('SELECT allow_posts FROM topics WHERE slug=?',(category,)).fetchone()['allow_posts']:
+                raise APIError(403,'Im gewählten Zielbereich sind keine Beiträge erlaubt.')
             db.execute('UPDATE posts SET title=?,body=?,category=? WHERE id=?',(title,body,category,match[1]))
+            if 'tag_ids' in data: self.assign_tags(db,'post',int(match[1]),data['tag_ids'])
             db.commit()
             return self.respond(200,{'ok':True})
         if method=='DELETE' and match:

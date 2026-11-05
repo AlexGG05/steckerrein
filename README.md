@@ -1,14 +1,45 @@
 # steckerrein.de — IT, 3D-Druck & Community
 
-Responsive Community mit Forum, Blog und SQLite. Python 3.12+ genügt; keine pip-/npm-Abhängigkeiten. Impressum und Datenschutz bleiben bytegenau erhalten.
+Responsive Community mit Forum, Blog und SQLite. Python 3.12+ und die in `requirements.txt` fest versionierte Bildbibliothek Pillow werden benötigt. Keine npm-Abhängigkeiten. Impressum und Datenschutz bleiben bytegenau erhalten.
 
 ## Aufbau und Berechtigungen
 
 - **Besucher:** Themenbereiche, Beiträge, Blogartikel und Antworten öffentlich lesen und durchsuchen. Keine Schreib- oder Bearbeitungsfunktionen.
-- **Verifizierte Mitglieder:** Unter vorhandenen Themenbereichen Beiträge veröffentlichen und antworten. Eigene Beiträge und Antworten bearbeiten; eigene Beiträge samt Antworten löschen.
-- **Administratorgruppe:** Zusätzlich Themenbereiche anlegen, Blogartikel veröffentlichen und alle Beiträge/Antworten bearbeiten oder löschen. Neue Bereiche erscheinen automatisch in der Navigation und in der Beitragsauswahl.
+- **Verifizierte Mitglieder:** In freigegebenen Themenbereichen Beiträge veröffentlichen und antworten. Eigenes öffentliches Profil mit Anzeigename, Profilbild, Bio und Website bearbeiten. Eigene Beiträge und Antworten bearbeiten; eigene Beiträge samt Antworten löschen.
+- **Administratorgruppe:** Zusätzlich Ober- und Unterthemen anlegen, bearbeiten, umhängen und löschen sowie Blogartikel veröffentlichen und alle Beiträge/Antworten bearbeiten oder löschen. Neue Bereiche erscheinen automatisch in der Navigation und in der Beitragsauswahl.
 
-Vier Themenbereiche (Allgemein, IT & Homelab, 3D-Druck, Projekte & Builds) und drei Einstiegsartikel werden einmalig angelegt. Es gibt keine Standardkonten oder Standardpasswörter. `/forum`, `/forum/<bereich>`, `/blog` und `/posts/<id>` sind direkt aufrufbar und funktionieren auch nach Neuladen. Alle Schreibrechte werden im Backend geprüft.
+Vier Themenbereiche (Allgemein, IT & Homelab, 3D-Druck, Projekte & Builds) und drei Einstiegsartikel werden einmalig angelegt. Es gibt keine Standardkonten oder Standardpasswörter. `/forum`, `/forum/<bereich>`, `/blog`, `/users/<nutzername>` und `/posts/<id>` sind direkt aufrufbar und funktionieren auch nach Neuladen. Alle Schreibrechte werden im Backend geprüft.
+
+## Oberthemen, Unterthemen und Schreibfreigabe
+
+In der Forum-Übersicht können Administratoren über „Bearbeiten“ und „Löschen“ die Bereiche verwalten. Innerhalb eines Bereichs stehen „Bereich bearbeiten“, „Bereich löschen“ und „＋ Unterthema“ bereit. Der übergeordnete Bereich lässt sich sowohl beim Erstellen als auch beim Bearbeiten auswählen. Eigene Unterbereiche können nicht als Eltern ausgewählt werden; das Backend verhindert auch direkte oder indirekte Hierarchieschleifen.
+
+Die Einstellung **„Beiträge und Antworten in diesem Bereich erlauben“** gilt jeweils für den ausgewählten Bereich, unabhängig von der Freigabe seiner Unterthemen. Beispiel:
+
+- **Hardware**: Beiträge nicht erlaubt, dient als Übersicht.
+- **Hardware / 3D-Druck**: Beiträge erlaubt, Mitglieder erstellen hier ihre Beiträge.
+- **Hardware / Homelab**: Beiträge erlaubt.
+
+Neue Oberthemen sind standardmäßig für neue Beiträge gesperrt, neue Unterthemen standardmäßig freigegeben. Bereits vorhandene Bereiche bleiben beim Update in ihrer bisherigen Schreibfreigabe erhalten; diese lässt sich anschließend gezielt ändern. Vorhandene Beiträge bleiben beim Sperren lesbar und durch ihre Autoren oder Administratoren bearbeitbar; neue Beiträge und Antworten werden auch bei direkten API-Aufrufen abgelehnt. Blogartikel sind unabhängig von der Forum-Schreibfreigabe redaktionell verwaltbar.
+
+Name und Beschreibung eines Bereichs können geändert werden, ohne vorhandene Links zu ändern. Ein leerer Bereich kann nach Bestätigung gelöscht werden. Enthält er Beiträge oder Blogartikel, muss ein anderer, für Beiträge freigegebener Zielbereich ausgewählt werden: Die Inhalte einschließlich Antworten und Autoren werden in einer Transaktion erhalten und verschoben. Bereiche mit Unterthemen können erst nach dem Umhängen oder Entfernen ihrer Unterthemen gelöscht werden. Ein gelöschter Standardbereich wird bei einem Neustart nicht wieder angelegt.
+
+## Öffentliche Nutzerprofile
+
+Über den Nutzernamen bzw. Avatar in der Kopfzeile und an Beiträgen/Antworten ist das öffentliche Profil erreichbar. „Profil bearbeiten“ ist nur im eigenen, angemeldeten und verifizierten Konto verfügbar. Der Nutzername bleibt unverändert; Anzeigename, Bio (bis 1.000 Zeichen) und eine HTTP-/HTTPS-Website sind optional. E-Mail, Passworthash und Sitzungsdaten werden niemals im öffentlichen Profil ausgegeben.
+
+Profilbilder können als PNG, JPEG oder WebP mit höchstens 1 MB und 4 Megapixeln hochgeladen und wieder entfernt werden. Das Backend decodiert das Bild, schneidet es quadratisch auf 256 × 256 Pixel zu und speichert neue PNG-Pixeldaten ohne Metadaten direkt in SQLite. SVG, HTML und ungültige Bilder werden abgelehnt. Datenbank-Backups enthalten damit auch die Profilbilder; ein zusätzliches Upload-Volume ist nicht nötig.
+
+## Adminbereich und Tags
+
+Verifizierte Administratoren erreichen über **Adminbereich** in der Navigation oder direkt unter `/admin` die Verwaltung:
+
+- **Themenbereiche:** Ober-/Unterthemen, Elternbereiche, Schreibfreigaben, Bearbeiten und sicheres Löschen.
+- **Beitragstags:** Tags wie „Offen“, „Gelöst“ oder Druckermodelle anlegen, umbenennen, einfärben und löschen. Die ersten beiden Tags werden einmalig angelegt. Autoren und Administratoren wählen beim Erstellen/Bearbeiten eines Beitrags bis zu zehn Tags aus. Andere Mitglieder dürfen fremde Zuordnungen nicht ändern.
+- **Nutzertags:** Öffentliche Kennzeichnungen anlegen, bearbeiten und löschen. Diese Tags sind getrennt von Beitragstags und vergeben **keine** Administrator- oder Schreibrechte.
+- **Mitglieder:** Nutzer suchen und bis zu zehn Nutzertags zuweisen oder entfernen. Die Tags erscheinen im öffentlichen Profil sowie beim Autor von Beiträgen und Antworten. E-Mail-Adressen oder Passwörter werden in dieser Liste nicht ausgegeben.
+
+Beim Umbenennen eines Tags aktualisieren sich bestehende Zuordnungen automatisch. Beim Löschen werden nur der Tag und seine Zuordnungen entfernt; Beiträge, Antworten und Konten bleiben bestehen. Die Datenbank prüft alle Zuordnungen, und sämtliche Verwaltungsendpunkte sind auf verifizierte Administratoren beschränkt. Die anfänglichen Tags werden nach einer Löschung nicht bei jedem Neustart neu angelegt.
 
 ## E-Mail-Verifizierung per SMTP
 
@@ -77,6 +108,7 @@ Anschließend neu anmelden. Im Forum erscheint „＋ Themenbereich“, im Blog 
 
 ```sh
 cd /workspace/steckerrein
+python3 -m pip install --requirement requirements.txt
 python3 server.py
 ```
 
@@ -88,7 +120,7 @@ node --check script.js
 docker compose up -d --build
 ```
 
-12 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenbereiche, Rollen, Änderungen, Antworten und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
+18 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
 
 ## Daten und Betrieb
 
@@ -100,4 +132,15 @@ docker compose exec steckerrein python -c "import sqlite3; src=sqlite3.connect('
 
 Die Datei danach außerhalb des Volumes aufbewahren; Wiederherstellung separat prüfen. Der Python-HTTP-Server ist für eine kleine Community hinter dem Reverse Proxy vorgesehen. Client-IP-Rate-Limits zusätzlich am vertrauenswürdigen Proxy setzen; die Anwendung vertraut keinen frei gesetzten Forwarded-IP-Headern.
 
-Noch nicht enthalten: Passwort-Wiederherstellung, Dateiuploads oder Beitragsbenachrichtigungen. Beiträge verwenden Klartext mit Absätzen, kein HTML. Die unveränderte Datenschutzerklärung muss vor öffentlichem Betrieb auf Benutzerkonten, E-Mail-Verifizierung, Sitzungen und öffentliche Beiträge geprüft werden.
+Noch nicht enthalten: Passwort-Wiederherstellung, Dateianhänge an Beiträgen oder Beitragsbenachrichtigungen. Beiträge verwenden Klartext mit Absätzen, kein HTML. Die unveränderte Datenschutzerklärung muss vor öffentlichem Betrieb auf Benutzerkonten, E-Mail-Verifizierung, Sitzungen, öffentliche Profile/Profilbilder und öffentliche Beiträge geprüft werden.
+
+## Docker-Build in der verwalteten Cloud-Umgebung
+
+Beim netzwerkgestützten Build die bereitgestellte Proxy-CA als BuildKit-Secret übergeben, ohne TLS-Prüfung abzuschalten:
+
+```sh
+docker build --secret id=proxy_ca,src="$CODEX_PROXY_CERT" -t ghcr.io/alexgg05/steckerrein:latest .
+docker compose up -d --no-build
+```
+
+Normale Docker-Hosts und GitHub Actions verwenden ihren regulären CA-Speicher. Die optionale CA wird ausschließlich beim Installationsschritt gemountet und nicht ins Image kopiert.

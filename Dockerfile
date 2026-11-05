@@ -2,6 +2,10 @@ FROM python:3.12-alpine
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8095 DATABASE_PATH=/data/community.db
 RUN addgroup -S community && adduser -S -G community community && mkdir /data && chown community:community /data
+COPY --chmod=644 requirements.txt ./
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -f /run/secrets/proxy_ca ]; then export PIP_CERT=/run/secrets/proxy_ca; fi; \
+    pip install --no-cache-dir --requirement requirements.txt
 COPY --chmod=644 server.py index.html style.css script.js impressum.html datenschutz.html ./
 USER community
 EXPOSE 8095

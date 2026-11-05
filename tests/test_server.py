@@ -165,7 +165,7 @@ class CommunityTest(unittest.TestCase):
     def test_09_topics_and_edit_permissions(self):
         owner,_=self.register('owner'); outsider,_=self.register('outsider'); admin,admin_user=self.register('administrator')
         with server.connect() as db: db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
-        data={'name':'Heimautomatisierung','description':'Alles rund um smarte Geräte im eigenen Zuhause.'}
+        data={'name':'Heimautomatisierung','description':'Alles rund um smarte Geräte im eigenen Zuhause.','allow_posts':True}
         self.assertEqual(self.request('/api/topics','POST',data)[0],401)
         self.assertEqual(self.request('/api/topics','POST',data,owner)[0],403)
         status,result,_=self.request('/api/topics','POST',data,admin)
@@ -236,5 +236,157 @@ class CommunityTest(unittest.TestCase):
             with patch('server.smtplib.SMTP',side_effect=OSError('offline')):
                 with self.assertRaises(server.APIError): server.send_verification('recipient@example.test','unprinted-token')
         finally: self.mail_mock=self.mail.start();type(self).mail_mock=self.mail_mock
+
+    def test_13_topic_hierarchy_and_safe_deletion(self):
+        admin,admin_user=self.register('hierarchyadmin'); member,_=self.register('hierarchymember')
+        with server.connect() as db: db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
+        def create(name,parent=None,allowed=False):
+            status,value,_=self.request('/api/topics','POST',{'name':name,'description':'Ein Bereich für gemeinsame Projekte.','parent_slug':parent,'allow_posts':allowed},admin)
+            self.assertEqual(status,201,value);return value['slug']
+        root=create('Hardware Oberthema');child=create('Server Unterthema',root,True);target=create('Ersatz Unterthema',root,True)
+        def setting(name,parent,allowed):return {'name':name,'description':'Eine aktualisierte Beschreibung.','parent_slug':parent,'allow_posts':allowed}
+        for method in ('PATCH','DELETE'):
+            self.assertEqual(self.request('/api/topics/'+root,method,{},None)[0],401)
+            self.assertEqual(self.request('/api/topics/'+root,method,{},member)[0],403)
+        self.assertEqual(self.request('/api/topics/'+root,'PATCH',setting('Hardware',child,False),admin)[0],400)
+        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server',child,True),admin)[0],400)
+        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server',root,'yes'),admin)[0],400)
+        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Hardware Oberthema',root,True),admin)[0],409)
+        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server Wissen',root,True),admin)[0],200)
+        post={'title':'Server zusammenbauen','body':'Wir bauen einen neuen Server für unser Homelab.','kind':'forum','category':root}
+        self.assertEqual(self.request('/api/posts','POST',post,member)[0],403)
+        status,value,_=self.request('/api/posts','POST',{**post,'category':child},member)
+        self.assertEqual(status,201);pid=value['id']
+        self.assertEqual(self.request('/api/posts/'+str(pid)+'/comments','POST',{'body':'Meine Antwort'},member)[0],201)
+        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server Wissen',root,False),admin)[0],200)
+        self.assertEqual(self.request('/api/posts/'+str(pid)+'/comments','POST',{'body':'Noch eine Antwort'},member)[0],403)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'category':child,'title':'Korrigierter Serverbeitrag'},member)[0],200)
+        self.assertEqual(self.request('/api/topics/'+root,'DELETE',{},admin)[0],409)
+        self.assertEqual(self.request('/api/topics/'+child,'DELETE',{},admin)[0],409)
+        self.assertEqual(self.request('/api/topics/'+child,'DELETE',{'move_to':child},admin)[0],400)
+        self.assertEqual(self.request('/api/topics/'+child,'DELETE',{'move_to':root},admin)[0],400)
+        self.assertEqual(self.request('/api/topics/'+child,'DELETE',{'move_to':'missing'},admin)[0],400)
+        before=self.request('/api/posts/'+str(pid))[1]
+        status,value,_=self.request('/api/topics/'+child,'DELETE',{'move_to':target},admin)
+        self.assertEqual(status,200);self.assertEqual(value['moved'],1)
+        after=self.request('/api/posts/'+str(pid))[1]
+        self.assertEqual(after['comments'],before['comments'])
+        self.assertEqual(after['post']['category'],target)
+        self.assertEqual(after['post']['user_id'],before['post']['user_id'])
+        self.assertEqual(self.request('/api/topics/'+child,'DELETE',{},admin)[0],404)
+        self.assertEqual(self.request('/api/topics/'+target,'PATCH',setting('Verschobener Bereich',None,True),admin)[0],200)
+        self.assertEqual(self.request('/api/topics/'+root,'DELETE',{},admin)[0],200)
+        server.initialize()
+        self.assertNotIn(root,[t['slug'] for t in self.request('/api/topics')[1]['topics']])
+
+    def test_14_profiles_and_uploads(self):
+        import io,base64
+        from PIL import Image,PngImagePlugin
+        owner,owner_user=self.register('profileowner');other,other_user=self.register('profileother')
+        data={'display_name':'Alex Maker','bio':'Ich mag IT und 3D-Druck.','website':'https://example.test/projects'}
+        self.assertEqual(self.request('/api/profile','PATCH',data)[0],401)
+        self.assertEqual(self.request('/api/profile','PATCH',data,owner)[0],200)
+        profile=self.request('/api/users/profileowner')[1]['profile']
+        self.assertEqual(profile['display_name'],'Alex Maker');self.assertEqual(profile['bio'],data['bio'])
+        for key in ('email','email_verified','password','token','avatar'):self.assertNotIn(key,profile)
+        self.assertEqual(self.request('/users/profileowner')[0],200)
+        self.assertEqual(self.request('/api/users/missing')[0],404)
+        self.assertEqual(self.request('/api/users/profileowner/avatar')[0],404)
+        # A supplied user_id cannot edit another account: /api/profile always targets the session owner.
+        self.assertEqual(self.request('/api/profile','PATCH',{**data,'display_name':'Other Maker','user_id':owner_user['id']},other)[0],200)
+        self.assertEqual(self.request('/api/users/profileowner')[1]['profile']['display_name'],'Alex Maker')
+        image=Image.new('RGB',(400,200),'orange');stream=io.BytesIO();metadata=PngImagePlugin.PngInfo();metadata.add_text('private-location','do not preserve');image.save(stream,format='PNG',pnginfo=metadata)
+        encoded=base64.b64encode(stream.getvalue()).decode()
+        self.assertEqual(self.request('/api/profile','PATCH',{**data,'avatar':encoded},owner)[0],200)
+        self.assertTrue(self.request('/api/users/profileowner')[1]['profile']['has_avatar'])
+        # The test helper returns image bytes because they are not JSON.
+        status,content,_=self.request('/api/users/profileowner/avatar')
+        self.assertEqual(status,200)
+        with Image.open(io.BytesIO(content)) as avatar:
+            self.assertEqual(avatar.size,(256,256));self.assertNotIn('private-location',avatar.info)
+        self.assertEqual(self.request('/api/profile','PATCH',{**data,'remove_avatar':True},owner)[0],200)
+        self.assertEqual(self.request('/api/users/profileowner/avatar')[0],404)
+        post={'title':'Ein Profilbeitrag','body':'Dieser öffentliche Beitrag gehört zum Profil.','category':'it'}
+        self.assertEqual(self.request('/api/posts','POST',post,owner)[0],201)
+        self.assertEqual(self.request('/api/posts?author=profileowner')[1]['total'],1)
+        self.assertEqual(self.request('/api/posts?author=profileother')[1]['total'],0)
+
+    def test_15_invalid_profile_data_and_images(self):
+        import base64,io
+        from PIL import Image
+        cookie,_=self.register('imagechecks')
+        data={'display_name':'Valid name','bio':'Eine normale Bio.','website':''}
+        for website in ('javascript:alert(1)','data:text/html,bad','https://user:password@example.test','https://example.test:bad','https://exa mple.test'):
+            self.assertEqual(self.request('/api/profile','PATCH',{**data,'website':website},cookie)[0],400)
+        for image in ('not base64!',base64.b64encode(b'<svg onload="alert(1)"></svg>').decode(),base64.b64encode(b'x'*1048577).decode()):
+            self.assertEqual(self.request('/api/profile','PATCH',{**data,'avatar':image},cookie)[0],400)
+        buf=io.BytesIO();Image.new('RGB',(2100,2100)).save(buf,format='PNG')
+        self.assertEqual(self.request('/api/profile','PATCH',{**data,'avatar':base64.b64encode(buf.getvalue()).decode()},cookie)[0],400)
+        self.assertEqual(self.request('/api/profile','PATCH',{**data,'remove_avatar':'yes'},cookie)[0],400)
+        self.assertEqual(self.request('/api/profile','PATCH',{**data,'bio':'x'*1001},cookie)[0],400)
+        self.assertFalse(self.request('/api/users/imagechecks')[1]['profile']['has_avatar'])
+
+    def test_16_tag_catalog_and_admin_permissions(self):
+        admin,admin_user=self.register('tagadmin');member,_=self.register('tagmember')
+        with server.connect() as db:db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
+        data={'kind':'post','name':'Bambu Lab A1','color':'blue'}
+        self.assertEqual(self.request('/api/admin/tags','POST',data)[0],401)
+        self.assertEqual(self.request('/api/admin/tags','POST',data,member)[0],403)
+        status,result,_=self.request('/api/admin/tags','POST',data,admin);self.assertEqual(status,201);tag_id=result['id']
+        self.assertEqual(self.request('/api/admin/tags','POST',{**data,'name':'bambu lab a1'},admin)[0],409)
+        self.assertEqual(self.request('/api/admin/tags','POST',{**data,'name':'Invalid','color':'url(javascript:bad)'},admin)[0],400)
+        self.assertEqual(self.request('/api/admin/tags','POST',{**data,'kind':'admin'},admin)[0],400)
+        for method in ('PATCH','DELETE'):
+            self.assertEqual(self.request('/api/admin/tags/'+str(tag_id),method,data,member)[0],403)
+        self.assertEqual(self.request('/api/admin/tags/'+str(tag_id),'PATCH',{**data,'name':'Bambu A1','color':'green'},admin)[0],200)
+        self.assertEqual(self.request('/api/admin/tags/'+str(tag_id),'PATCH',{**data,'kind':'user'},admin)[0],400)
+        self.assertEqual(self.request('/api/admin/users')[0],401)
+        self.assertEqual(self.request('/api/admin/users',cookie=member)[0],403)
+        result=self.request('/api/admin/users?q=tagmember',cookie=admin)[1]
+        self.assertEqual(result['total'],1)
+        for key in ('email','password','avatar'):self.assertNotIn(key,result['users'][0])
+        self.assertEqual(self.request('/admin')[0],200)
+
+    def test_17_post_tags_are_controlled_by_author_or_admin(self):
+        admin,admin_user=self.register('posttagadmin');author,_=self.register('posttagauthor');other,_=self.register('posttagother')
+        with server.connect() as db:db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
+        catalog=self.request('/api/tags')[1]['tags'];open_id=next(t['id'] for t in catalog if t['kind']=='post' and t['name']=='Offen');solved_id=next(t['id'] for t in catalog if t['kind']=='post' and t['name']=='Gelöst')
+        status,value,_=self.request('/api/admin/tags','POST',{'kind':'user','name':'Helfer','color':'purple'},admin);self.assertEqual(status,201);user_tag=value['id']
+        post={'title':'Ein Druckerproblem','body':'Mein Drucker benötigt einen neuen Extruder.','category':'it','tag_ids':[open_id]}
+        status,value,_=self.request('/api/posts','POST',post,author);self.assertEqual(status,201);pid=value['id']
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['tags'][0]['name'],'Offen')
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'tag_ids':[solved_id]},other)[0],403)
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'tag_ids':[solved_id]},author)[0],200)
+        for ids in ([user_tag],[999999],[open_id,open_id],['1'],[True],list(range(1,12))):
+            self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'title':'Darf nicht gespeichert werden','tag_ids':ids},author)[0],400)
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['title'],post['title'])
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['tags'][0]['name'],'Gelöst')
+        self.assertEqual(self.request('/api/posts/'+str(pid),'PATCH',{**post,'tag_ids':[]},admin)[0],200)
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['tags'],[])
+        self.assertEqual(self.request('/api/posts','POST',{**post,'tag_ids':[user_tag]},author)[0],400)
+        self.assertEqual(self.request('/api/posts?author=posttagauthor')[1]['total'],1)
+
+    def test_18_user_tags_and_safe_tag_deletion(self):
+        admin,admin_user=self.register('usertagadmin');member,member_user=self.register('usertagmember')
+        with server.connect() as db:db.execute('UPDATE users SET admin=1 WHERE id=?',(admin_user['id'],))
+        status,value,_=self.request('/api/admin/tags','POST',{'kind':'user','name':'3D-Druck Experte','color':'orange'},admin);self.assertEqual(status,201);tag=value['id']
+        target='/api/admin/users/'+str(member_user['id'])+'/tags'
+        self.assertEqual(self.request(target,'PATCH',{'tag_ids':[tag]})[0],401)
+        self.assertEqual(self.request(target,'PATCH',{'tag_ids':[tag]},member)[0],403)
+        self.assertEqual(self.request(target,'PATCH',{'tag_ids':[tag]},admin)[0],200)
+        profile=self.request('/api/users/usertagmember')[1]['profile'];self.assertEqual(profile['tags'][0]['name'],'3D-Druck Experte');self.assertEqual(profile['admin'],0)
+        self.assertEqual(self.request('/api/me',cookie=member)[1]['user']['admin'],0)
+        post={'title':'Ein Expertenbeitrag','body':'Ein hilfreicher Beitrag mit einem öffentlichen Nutzertag.','category':'it'}
+        status,value,_=self.request('/api/posts','POST',post,member);self.assertEqual(status,201);pid=value['id']
+        self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['author_tags'][0]['id'],tag)
+        post_tag=next(t['id'] for t in self.request('/api/tags')[1]['tags'] if t['kind']=='post')
+        self.assertEqual(self.request(target,'PATCH',{'tag_ids':[post_tag]},admin)[0],400)
+        self.assertEqual(self.request('/api/users/usertagmember')[1]['profile']['tags'][0]['id'],tag)
+        self.assertEqual(self.request('/api/admin/tags/'+str(tag),'DELETE',{},admin)[0],200)
+        self.assertEqual(self.request('/api/users/usertagmember')[1]['profile']['tags'],[])
+        self.assertEqual(self.request('/api/posts/'+str(pid))[0],200)
+        self.assertEqual(self.request('/api/admin/users/999999/tags','PATCH',{'tag_ids':[]},admin)[0],404)
+        server.initialize()
+        self.assertNotIn(tag,[t['id'] for t in self.request('/api/tags')[1]['tags']])
 
 if __name__=='__main__':unittest.main()

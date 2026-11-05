@@ -1,9 +1,15 @@
 services:
   steckerrein:
+    build: .
     image: ghcr.io/alexgg05/steckerrein:latest
-    container_name: steckerrein
     restart: unless-stopped
     ports:
-      - "8095:80"
+      - "8095:8095"
+    environment:
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+    volumes:
+      - community-data:/data
     security_opt:
       - no-new-privileges:true
+volumes:
+  community-data:

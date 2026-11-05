@@ -251,7 +251,7 @@ class CommunityTest(unittest.TestCase):
         self.assertEqual(self.request('/api/topics/'+root,'PATCH',setting('Hardware',child,False),admin)[0],400)
         self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server',child,True),admin)[0],400)
         self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server',root,'yes'),admin)[0],400)
-        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Hardware Oberthema',root,True),admin)[0],409)
+        self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Ersatz Unterthema',root,True),admin)[0],409)
         self.assertEqual(self.request('/api/topics/'+child,'PATCH',setting('Server Wissen',root,True),admin)[0],200)
         post={'title':'Server zusammenbauen','body':'Wir bauen einen neuen Server für unser Homelab.','kind':'forum','category':root}
         self.assertEqual(self.request('/api/posts','POST',post,member)[0],403)
@@ -474,5 +474,63 @@ class CommunityTest(unittest.TestCase):
             self.assertEqual(self.request('/api/posts','POST',{**post,'images':images},cookie)[0],400)
         self.assertEqual(self.request('/api/posts?author=imagevalidation')[1]['total'],0)
         self.assertEqual(self.request('/api/posts','POST',{**post,'images':[self.post_image()]} )[0],401)
+
+    def test_23_same_topic_names_under_different_parents(self):
+        cookie,user=self.register('duplicatetopicadmin')
+        with server.connect() as db:db.execute('UPDATE users SET admin=1 WHERE id=?',(user['id'],))
+        def create(name,parent):return self.request('/api/topics','POST',{'name':name,'description':'Fragen und hilfreiche Antworten für diesen Bereich.','parent_slug':parent,'allow_posts':True},cookie)
+        status,first,_=create('Fragen & Antworten','it');self.assertEqual(status,201)
+        status,second,_=create('Fragen & Antworten','3d-druck');self.assertEqual(status,201)
+        self.assertNotEqual(first['slug'],second['slug'])
+        self.assertEqual(create('fragen & antworten','it')[0],409)
+        self.assertEqual(create('Allgemein',None)[0],409)
+        settings={'name':'Fragen & Antworten','description':'Eine aktualisierte Beschreibung für diesen Bereich.','parent_slug':'it','allow_posts':True}
+        self.assertEqual(self.request('/api/topics/'+second['slug'],'PATCH',settings,cookie)[0],409)
+        self.assertEqual(self.request('/api/topics/'+second['slug'],'PATCH',{**settings,'parent_slug':'projekte'},cookie)[0],200)
+        server.initialize()
+        rows=[r for r in self.request('/api/topics')[1]['topics'] if r['name']=='Fragen & Antworten']
+        self.assertEqual(len(rows),2)
+
+    def test_24_identical_post_titles(self):
+        first,_=self.register('sametitlefirst');second,_=self.register('sametitlesecond')
+        data={'title':'Mein Druck haftet nicht','body':'Ich brauche Hilfe beim ersten Layer meines Druckers.','category':'it'}
+        ids=[]
+        for cookie in (first,second,first):
+            status,result,_=self.request('/api/posts','POST',data,cookie)
+            self.assertEqual(status,201);ids.append(result['id'])
+        self.assertEqual(len(set(ids)),3)
+        self.assertEqual(self.request('/api/posts/'+str(ids[1]),'PATCH',data,second)[0],200)
+        for pid in ids:self.assertEqual(self.request('/api/posts/'+str(pid))[1]['post']['title'],data['title'])
+
+    def test_25_legacy_global_topic_unique_migration(self):
+        original=server.DB
+        try:
+            server.DB=Path(self.temp.name)/'global-topic-names.db'
+            with server.connect() as db:
+                db.executescript("""
+                CREATE TABLE topics(slug TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE UNIQUE,description TEXT NOT NULL,parent_slug TEXT REFERENCES topics(slug),allow_posts INTEGER NOT NULL DEFAULT 1,allow_replies INTEGER NOT NULL DEFAULT 1);
+                CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                INSERT INTO metadata VALUES('topics_initialized','1'),('initialized','1');
+                INSERT INTO topics VALUES('it','IT & Homelab','IT Fragen',NULL,0,1);
+                INSERT INTO topics VALUES('3d-druck','3D-Druck','Druckerfragen',NULL,0,0);
+                INSERT INTO topics VALUES('questions','Fragen & Antworten','Hilfe zum Homelab','it',1,1);
+                CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password TEXT NOT NULL,admin INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL);
+                CREATE TABLE posts(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,category TEXT NOT NULL,title TEXT NOT NULL,body TEXT NOT NULL,user_id INTEGER,created INTEGER NOT NULL);
+                INSERT INTO users VALUES(7,'existing','not-a-real-password',1,123);
+                INSERT INTO posts VALUES(21,'forum','questions','Vorhandener Beitrag','Dieser Beitrag muss unverändert erhalten bleiben.',7,456);
+                """)
+            server.initialize();server.initialize()
+            with server.connect() as db:
+                self.assertFalse(db.execute('PRAGMA foreign_key_check').fetchall())
+                self.assertEqual(db.execute('PRAGMA foreign_keys').fetchone()[0],1)
+                rows=db.execute('SELECT * FROM topics ORDER BY rowid').fetchall()
+                self.assertEqual([r['slug'] for r in rows],['it','3d-druck','questions'])
+                self.assertEqual(rows[0]['allow_posts'],0);self.assertEqual(rows[0]['allow_replies'],1)
+                self.assertEqual(rows[2]['parent_slug'],'it')
+                post=db.execute('SELECT * FROM posts WHERE id=21').fetchone();self.assertEqual(post['category'],'questions');self.assertEqual(post['user_id'],7)
+                db.execute("INSERT INTO topics(slug,name,description,parent_slug) VALUES('printquestions','Fragen & Antworten','Druckerfragen','3d-druck')")
+                with self.assertRaises(server.sqlite3.IntegrityError):db.execute("INSERT INTO topics(slug,name,description,parent_slug) VALUES('duplicate','FRAGEN & ANTWORTEN','Nicht doppelt','it')")
+                with self.assertRaises(server.sqlite3.IntegrityError):db.execute("INSERT INTO topics(slug,name,description,parent_slug) VALUES('orphan','Orphan','Nicht verwaist','missing')")
+        finally:server.DB=original
 
 if __name__=='__main__':unittest.main()

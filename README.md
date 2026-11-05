@@ -12,7 +12,9 @@ Vier Themenbereiche (Allgemein, IT & Homelab, 3D-Druck, Projekte & Builds) und d
 
 ## Oberthemen, Unterthemen und Schreibfreigabe
 
-In der Forum-Übersicht können Administratoren über „Bearbeiten“ und „Löschen“ die Bereiche verwalten. Innerhalb eines Bereichs stehen „Bereich bearbeiten“, „Bereich löschen“ und „＋ Unterthema“ bereit. Der übergeordnete Bereich lässt sich sowohl beim Erstellen als auch beim Bearbeiten auswählen. Eigene Unterbereiche können nicht als Eltern ausgewählt werden; das Backend verhindert auch direkte oder indirekte Hierarchieschleifen.
+In der Forum-Übersicht können Administratoren über „Bearbeiten“ und „Löschen“ die Bereiche verwalten. Innerhalb eines Bereichs stehen „Bereich bearbeiten“, „Bereich löschen“ und „＋ Unterthema“ bereit. Der übergeordnete Bereich lässt sich sowohl beim Erstellen als auch beim Bearbeiten auswählen. Gleichnamige Unterthemen sind in verschiedenen Oberbereichen erlaubt, etwa „IT & Homelab / Fragen & Antworten“ und „3D-Druck / Fragen & Antworten“. Nur unmittelbar nebeneinander unter demselben Elternbereich müssen Namen eindeutig sein (Groß-/Kleinschreibung wird dabei ignoriert). Beiträge dürfen beliebig gleiche Titel tragen und haben unabhängige IDs und Links. Die Migration bestehender Datenbanken erhält die Bereichs-IDs, Hierarchie, Schreibrechte und Inhalte.
+
+Eigene Unterbereiche können nicht als Eltern ausgewählt werden; das Backend verhindert auch direkte oder indirekte Hierarchieschleifen.
 
 Die Einstellungen **„Neue Beiträge in diesem Bereich erlauben“** und **„Antworten auf bestehende Beiträge erlauben“** sind unabhängig. Beide gelten jeweils für den ausgewählten Bereich, unabhängig von seinen Unterthemen. Für einen Tagwunsch- oder Ankündigungsbereich neue Beiträge ausschalten und Antworten einschalten: Mitglieder können dann ausschließlich unter bestehenden Beiträgen antworten. Beispiel:
 
@@ -128,7 +130,7 @@ node --check script.js
 docker compose up -d --build
 ```
 
-22 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte, Beitragsbilder und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
+25 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte, Beitragsbilder und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
 
 ## Daten und Betrieb
 

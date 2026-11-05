@@ -63,7 +63,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS email_tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL, sent INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS rate_limits(bucket TEXT NOT NULL, subject TEXT NOT NULL, started INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(bucket,subject));
         """)
-        db.execute('CREATE TABLE IF NOT EXISTS topics(slug TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT NOT NULL)')
+        db.execute('CREATE TABLE IF NOT EXISTS topics(slug TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE, description TEXT NOT NULL)')
         topic_columns={r['name'] for r in db.execute('PRAGMA table_info(topics)')}
         if 'parent_slug' not in topic_columns:
             db.execute('ALTER TABLE topics ADD COLUMN parent_slug TEXT REFERENCES topics(slug)')
@@ -72,6 +72,7 @@ def initialize():
         if 'allow_replies' not in topic_columns:
             db.execute('ALTER TABLE topics ADD COLUMN allow_replies INTEGER NOT NULL DEFAULT 1 CHECK(allow_replies IN (0,1))')
             db.execute('UPDATE topics SET allow_replies=allow_posts')
+        migrate_topic_names(db)
         db.executescript("""
         CREATE TABLE IF NOT EXISTS post_images(id INTEGER PRIMARY KEY, token TEXT NOT NULL UNIQUE, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, mime TEXT NOT NULL, data BLOB NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL, position INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS post_images_post ON post_images(post_id,position);
@@ -96,6 +97,34 @@ def initialize():
             for i, (category, title, body) in enumerate(articles):
                 db.execute('INSERT INTO posts(kind,category,title,body,created) VALUES(?,?,?,?,?)', ('blog',category,title,body,int(time.time())-i*60))
             db.execute("INSERT INTO metadata VALUES('initialized','1')")
+
+def migrate_topic_names(db):
+    # SQLite autoindexes for column UNIQUE cannot be dropped. Rebuild the legacy
+    # table using SQLite's transactional migration pattern, preserving rowids/slugs.
+    global_unique=False
+    for index in db.execute('PRAGMA index_list(topics)').fetchall():
+        if index['unique']:
+            columns=[r['name'] for r in db.execute('SELECT name FROM pragma_index_info(?)',(index['name'],))]
+            if columns==['name'] and index['origin']=='u': global_unique=True
+    if global_unique:
+        db.commit()
+        db.execute('PRAGMA foreign_keys=OFF')
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("CREATE TABLE topics_new(slug TEXT PRIMARY KEY,name TEXT NOT NULL COLLATE NOCASE,description TEXT NOT NULL,parent_slug TEXT REFERENCES topics_new(slug),allow_posts INTEGER NOT NULL DEFAULT 1 CHECK(allow_posts IN (0,1)),allow_replies INTEGER NOT NULL DEFAULT 1 CHECK(allow_replies IN (0,1)))")
+            db.execute('INSERT INTO topics_new(rowid,slug,name,description,parent_slug,allow_posts,allow_replies) SELECT rowid,slug,name,description,parent_slug,allow_posts,allow_replies FROM topics')
+            db.execute('DROP TABLE topics')
+            db.execute('ALTER TABLE topics_new RENAME TO topics')
+            db.execute('CREATE UNIQUE INDEX topics_sibling_names ON topics(parent_slug,name) WHERE parent_slug IS NOT NULL')
+            db.execute('CREATE UNIQUE INDEX topics_root_names ON topics(name) WHERE parent_slug IS NULL')
+            if db.execute('PRAGMA foreign_key_check').fetchone(): raise sqlite3.IntegrityError('Foreign-key check failed during topic migration')
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally: db.execute('PRAGMA foreign_keys=ON')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS topics_sibling_names ON topics(parent_slug,name) WHERE parent_slug IS NOT NULL')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS topics_root_names ON topics(name) WHERE parent_slug IS NULL')
 
 def password_hash(password):
     salt = secrets.token_hex(16)
@@ -568,7 +597,7 @@ class Handler(BaseHTTPRequestHandler):
             parent,allowed,replies=self.topic_settings(db,data)
             slug=secrets.token_hex(8)
             try: db.execute('INSERT INTO topics(slug,name,description,parent_slug,allow_posts,allow_replies) VALUES(?,?,?,?,?,?)',(slug,name,description,parent,int(allowed),int(replies)))
-            except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
+            except sqlite3.IntegrityError: raise APIError(409,'In diesem Oberbereich gibt es bereits einen Themenbereich mit diesem Namen.')
             db.commit()
             return self.respond(201,{'slug':slug})
         topic_match=re.fullmatch(r'/api/topics/([a-z0-9-]+)',path)
@@ -584,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
                 description=self.field(data,'description',10,300)
                 parent,allowed,replies=self.topic_settings(db,data,topic)
                 try: db.execute('UPDATE topics SET name=?,description=?,parent_slug=?,allow_posts=?,allow_replies=? WHERE slug=?',(name,description,parent,int(allowed),int(replies),slug))
-                except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
+                except sqlite3.IntegrityError: raise APIError(409,'In diesem Oberbereich gibt es bereits einen Themenbereich mit diesem Namen.')
                 db.commit()
                 return self.respond(200,{'slug':slug})
             if db.execute('SELECT 1 FROM topics WHERE parent_slug=?',(slug,)).fetchone():

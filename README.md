@@ -1,3 +1,5 @@
+> **Aktueller Betrieb: Aufbauseite.** Standardmäßig ist `MAINTENANCE_MODE=1` aktiv. Öffentlich werden nur „Aktuell im Aufbau“, Impressum und Datenschutz angeboten. Auch direkte Community-/API-/Bildaufrufe sind gesperrt; vorhandene Daten werden nicht gelöscht. `/health` bleibt für den Docker-Healthcheck erreichbar. Zur späteren Reaktivierung ausdrücklich `MAINTENANCE_MODE=0` im Container setzen. Für lokale Entwicklung ebenfalls `MAINTENANCE_MODE=0 python3 server.py` verwenden. Die Tests deaktivieren den Modus nur in ihren isolierten Testprozessen.
+
 # steckerrein.de — IT, 3D-Druck & Community
 
 Responsive Community mit Forum, Blog und SQLite. Python 3.12+ und die in `requirements.txt` fest versionierte Bildbibliothek Pillow werden benötigt. Keine npm-Abhängigkeiten. Impressum und Datenschutz bleiben bytegenau erhalten.
@@ -130,7 +132,7 @@ node --check script.js
 docker compose up -d --build
 ```
 
-25 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte, Beitragsbilder und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
+26 Integrationstests prüfen Registrierung, fehlende/abgelaufene/wiederverwendete Bestätigungen, erneuten Versand, SMTP-TLS, Kontenmigration, Sitzungen, Themenhierarchie, Schreibfreigaben, sichere Bereichslöschung, Rollen, Änderungen, Antworten, öffentliche Profile, validierte Profilbilder, Beitrags-/Nutzertags, Adminrechte, Beitragsbilder und CSRF. Die Tests nutzen temporäre Datenbanken und versenden keine echten E-Mails. Zusätzlich wurden die vollständigen Gäste-, Mitglieder- und Administratorabläufe im Desktop- und Mobilbrowser geprüft.
 
 ## Daten und Betrieb
 

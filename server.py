@@ -30,6 +30,9 @@ VERIFY_TTL = 24 * 3600
 RATE_LOCK = threading.Lock()
 TAG_COLORS = {'green','purple','blue','orange','red','gray'}
 
+def maintenance_enabled():
+    return os.environ.get('MAINTENANCE_MODE','1') != '0'
+
 def connect():
     db = sqlite3.connect(DB, timeout=10)
     db.row_factory = sqlite3.Row
@@ -244,6 +247,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path=='/health': return self.respond(200,{'status':'ok'})
+        if maintenance_enabled() and path not in ('/impressum.html','/datenschutz.html','/style.css'):
+            if path.startswith(('/api/','/media/')): return self.respond(503,{'error':'Die Website wird aktuell überarbeitet.'})
+            data=(ROOT/'maintenance.html').read_bytes()
+            self.send_response(200);self.headers_common()
+            self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Cache-Control','no-store')
+            self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data);return
         if path.startswith('/api/'):
             return self.dispatch('GET')
         media=re.fullmatch(r'/media/([a-f0-9]{32})',path)
@@ -273,6 +283,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self): self.dispatch('DELETE')
 
     def dispatch(self, method):
+        if maintenance_enabled(): return self.respond(503,{'error':'Die Website wird aktuell überarbeitet.'})
         try:
             with connect() as db:
                 self.api(db,method)

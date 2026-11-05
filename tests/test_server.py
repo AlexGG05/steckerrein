@@ -17,7 +17,7 @@ class CommunityTest(unittest.TestCase):
     def setUpClass(cls):
         cls.temp=tempfile.TemporaryDirectory()
         server.DB=Path(cls.temp.name)/'test.db'
-        cls.env=patch.dict(os.environ, {'PUBLIC_URL':'https://steckerrein.de','SMTP_HOST':'smtp.example.test','SMTP_PORT':'587','SMTP_USER':'test','SMTP_PASSWORD':'test-only','MAIL_FROM':'forum@example.test'})
+        cls.env=patch.dict(os.environ, {'MAINTENANCE_MODE':'0','PUBLIC_URL':'https://steckerrein.de','SMTP_HOST':'smtp.example.test','SMTP_PORT':'587','SMTP_USER':'test','SMTP_PASSWORD':'test-only','MAIL_FROM':'forum@example.test'})
         cls.env.start()
         cls.mail=patch('server.send_verification')
         cls.mail_mock=cls.mail.start()
@@ -532,5 +532,22 @@ class CommunityTest(unittest.TestCase):
                 with self.assertRaises(server.sqlite3.IntegrityError):db.execute("INSERT INTO topics(slug,name,description,parent_slug) VALUES('duplicate','FRAGEN & ANTWORTEN','Nicht doppelt','it')")
                 with self.assertRaises(server.sqlite3.IntegrityError):db.execute("INSERT INTO topics(slug,name,description,parent_slug) VALUES('orphan','Orphan','Nicht verwaist','missing')")
         finally:server.DB=original
+
+    def test_26_maintenance_hides_community_but_preserves_legal(self):
+        cookie,_=self.register('maintenanceuser')
+        with server.connect() as db: before=db.execute('SELECT COUNT(*) FROM posts').fetchone()[0]
+        with patch.dict(os.environ,{'MAINTENANCE_MODE':'1'}):
+            for path in ('/','/forum','/blog','/admin','/posts/1','/users/maintenanceuser'):
+                status,content,_=self.request(path)
+                self.assertEqual(status,200);self.assertIn(b'Aktuell im Aufbau.',content)
+                self.assertNotIn(b'<script',content)
+            for path in ('/api/posts','/api/topics','/api/me','/media/'+'0'*32):self.assertEqual(self.request(path,cookie=cookie)[0],503)
+            for method,path in (('POST','/api/register'),('POST','/api/posts'),('PATCH','/api/posts/1'),('DELETE','/api/posts/1')):
+                self.assertEqual(self.request(path,method,{},cookie)[0],503)
+            for filename in ('impressum.html','datenschutz.html','style.css'):
+                status,content,_=self.request('/'+filename);self.assertEqual(status,200);self.assertEqual(content,(server.ROOT/filename).read_bytes())
+            self.assertEqual(self.request('/health')[0],200)
+        with server.connect() as db:self.assertEqual(db.execute('SELECT COUNT(*) FROM posts').fetchone()[0],before)
+        self.assertEqual(self.request('/api/posts')[0],200)
 
 if __name__=='__main__':unittest.main()

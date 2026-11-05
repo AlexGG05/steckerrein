@@ -5,3 +5,6 @@ compose.yaml
 data
 __pycache__
 tests
+
+.env
+.env.*

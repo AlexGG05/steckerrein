@@ -9,7 +9,10 @@ import re
 import secrets
 import sqlite3
 import time
-from http import HTTPStatus
+import smtplib
+import ssl
+from email.message import EmailMessage
+import threading
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -18,6 +21,8 @@ ROOT = Path(__file__).parent
 DB = Path(os.environ.get('DATABASE_PATH', ROOT / 'data/community.db'))
 CATEGORIES = {'allgemein': 'Allgemein', 'it': 'IT & Homelab', '3d-druck': '3D-Druck', 'projekte': 'Projekte & Builds'}
 SESSION_TTL = 7 * 86400
+VERIFY_TTL = 24 * 3600
+RATE_LOCK = threading.Lock()
 
 def connect():
     db = sqlite3.connect(DB, timeout=10)
@@ -37,6 +42,25 @@ def initialize():
         CREATE INDEX IF NOT EXISTS comments_post ON comments(post_id);
         CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         ''')
+        db.execute('BEGIN IMMEDIATE')
+        columns = {r['name'] for r in db.execute('PRAGMA table_info(users)')}
+        if 'email' not in columns:
+            db.execute('ALTER TABLE users ADD COLUMN email TEXT COLLATE NOCASE')
+        if 'email_verified' not in columns:
+            db.execute('ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0')
+            # Existing accounts must verify as well. Revoke pre-migration sessions.
+            db.execute('DELETE FROM sessions')
+        db.executescript("""
+        CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(email) WHERE email IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS email_tokens(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL, sent INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS rate_limits(bucket TEXT NOT NULL, subject TEXT NOT NULL, started INTEGER NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(bucket,subject));
+        """)
+        db.execute('CREATE TABLE IF NOT EXISTS topics(slug TEXT PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE, description TEXT NOT NULL)')
+        if not db.execute("SELECT 1 FROM metadata WHERE key='topics_initialized'").fetchone():
+            descriptions={'it':'Server, Netzwerke, Software und dein eigenes Homelab.', '3d-druck':'Drucker, Filamente, Slicer und Hilfe beim nächsten Druck.', 'projekte':'Zeig deine Builds und entwickle gemeinsam neue Ideen.', 'allgemein':'Vorstellen, austauschen und über den Tellerrand schauen.'}
+            for slug,name in CATEGORIES.items():
+                db.execute('INSERT OR IGNORE INTO topics VALUES(?,?,?)',(slug,name,descriptions[slug]))
+            db.execute("INSERT INTO metadata VALUES('topics_initialized','1')")
         if not db.execute("SELECT 1 FROM metadata WHERE key='initialized'").fetchone():
             articles = [
                 ('it', 'Dein Homelab beginnt mit einer guten Frage', 'Ein eigener Server muss kein großes Rack sein. Ein ausrangierter Mini-PC mit 8 GB RAM reicht oft für die ersten Dienste.\n\nÜberlege zuerst, was du lernen möchtest: Backups, Container oder Netzwerke? Starte mit einem Dienst und dokumentiere die Einrichtung. Docker Compose macht Konfigurationen nachvollziehbar.\n\nBevor du Dienste ins Internet stellst, richte Updates, starke Zugangsdaten und Backups ein. Teste auch die Wiederherstellung. Für den Fernzugriff ist ein VPN oft der bessere Einstieg als offene Ports.\n\nWas läuft in deinem Homelab? Eröffne ein Thema im Forum und zeig uns dein Setup.'),
@@ -55,14 +79,53 @@ def password_matches(password, stored):
     actual = hashlib.scrypt(password.encode(), salt=salt.encode(), n=16384, r=8, p=1).hex()
     return hmac.compare_digest(actual, expected)
 
+
+def public_url():
+    value = os.environ.get('PUBLIC_URL', '').rstrip('/')
+    parsed = urlsplit(value)
+    if parsed.scheme != 'https' or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username:
+        raise APIError(503, 'Die öffentliche HTTPS-Adresse ist noch nicht eingerichtet.')
+    return value
+
+def mail_configuration():
+    public_url()
+    if not all(os.environ.get(key) for key in ('MAIL_FROM', 'SMTP_HOST', 'SMTP_USER', 'SMTP_PASSWORD')):
+        raise APIError(503, 'Der E-Mail-Versand ist noch nicht eingerichtet. Bitte kontaktiere den Betreiber.')
+
+def send_verification(email, token):
+    link = public_url() + '/#verify/' + token
+    subject = 'Bestätige deine E-Mail-Adresse – steckerrein.de'
+    body = ('Willkommen bei steckerrein.de!\n\nBestätige deine E-Mail-Adresse über diesen Link:\n'
+            + link + '\n\nDer Link ist 24 Stunden gültig und kann nur einmal verwendet werden. '
+            'Danach kannst du dich anmelden. Wenn du diese Anfrage nicht gestellt hast, ignoriere diese Nachricht.')
+    try:
+        message = EmailMessage()
+        message['Subject'] = subject
+        message['From'] = os.environ['MAIL_FROM']
+        message['To'] = email
+        message.set_content(body)
+        host = os.environ['SMTP_HOST']
+        port = int(os.environ.get('SMTP_PORT', '587'))
+        if port not in (465, 587): raise ValueError('Use TLS SMTP on 465 or 587')
+        context = ssl.create_default_context()
+        if port == 465:
+            client = smtplib.SMTP_SSL(host, port, timeout=15, context=context)
+        else:
+            client = smtplib.SMTP(host, port, timeout=15)
+        with client:
+            if port == 587: client.starttls(context=context)
+            client.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+            client.send_message(message)
+    except (OSError, ValueError, smtplib.SMTPException):
+        # Never expose provider responses, recipient details or verification tokens.
+        raise APIError(503, 'Die Bestätigungsmail konnte nicht versendet werden. Bitte versuche es später erneut.')
+
 class APIError(Exception):
-    def __init__(self, status, message):
-        self.status, self.message = status, message
+    def __init__(self, status, message, code=None):
+        self.status, self.message, self.code = status, message, code
 
 class Handler(BaseHTTPRequestHandler):
     server_version = 'Steckerrein'
-    # Bounded local rate limit; proxy deployments should also rate-limit at the edge.
-    attempts = {}
 
     def log_message(self, fmt, *args):
         # Never log request bodies, passwords, cookies or query strings.
@@ -92,11 +155,12 @@ class Handler(BaseHTTPRequestHandler):
         token = cookie.get('session')
         if not token: return None
         hashed = hashlib.sha256(token.value.encode()).hexdigest()
-        return db.execute('SELECT u.id,u.username,u.admin FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?', (hashed,int(time.time()))).fetchone()
+        return db.execute('SELECT u.id,u.username,u.admin,u.email_verified FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?', (hashed,int(time.time()))).fetchone()
 
     def require_user(self, db):
         user = self.user(db)
         if not user: raise APIError(401,'Bitte melde dich zuerst an.')
+        if not user['email_verified']: raise APIError(403,'Bitte bestätige zuerst deine E-Mail-Adresse.', 'EMAIL_UNVERIFIED')
         return user
 
     def body(self):
@@ -126,6 +190,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.dispatch('GET')
         files = {'/':'index.html','/index.html':'index.html','/style.css':'style.css','/script.js':'script.js','/impressum.html':'impressum.html','/datenschutz.html':'datenschutz.html'}
         filename = files.get(path)
+        if path in ('/forum','/blog') or re.fullmatch(r'/forum/[a-z0-9-]+|/posts/\d+',path): filename='index.html'
         if not filename: return self.respond(404,{'error':'Seite nicht gefunden.'})
         data = (ROOT/filename).read_bytes()
         mime = {'.html':'text/html','.css':'text/css','.js':'text/javascript'}[Path(filename).suffix]
@@ -133,18 +198,19 @@ class Handler(BaseHTTPRequestHandler):
         self.headers_common()
         self.send_header('Content-Type',mime+'; charset=utf-8')
         self.send_header('Content-Length',str(len(data)))
-        self.send_header('Cache-Control','no-cache')
+        self.send_header('Cache-Control','no-store')
         self.end_headers()
         self.wfile.write(data)
 
     def do_POST(self): self.dispatch('POST')
+    def do_PATCH(self): self.dispatch('PATCH')
     def do_DELETE(self): self.dispatch('DELETE')
 
     def dispatch(self, method):
         try:
             with connect() as db:
                 self.api(db,method)
-        except APIError as e: self.respond(e.status,{'error':e.message})
+        except APIError as e: self.respond(e.status,{'error':e.message, 'code':e.code})
         except sqlite3.OperationalError:
             self.respond(503,{'error':'Die Datenbank ist gerade beschäftigt. Bitte versuche es erneut.'})
         except Exception:
@@ -152,9 +218,47 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.respond(500,{'error':'Ein interner Fehler ist aufgetreten.'})
 
+    def rate_limit(self, db, bucket, limit):
+        # Use the TCP peer, not spoofable forwarded IP headers. Proxy deployments
+        # must additionally apply client-IP limits at the trusted edge.
+        subject=hashlib.sha256(self.client_address[0].encode()).hexdigest()
+        now=int(time.time())
+        with RATE_LOCK:
+            db.execute('DELETE FROM rate_limits WHERE started<?',(now-900,))
+            row=db.execute('SELECT count FROM rate_limits WHERE bucket=? AND subject=?',(bucket,subject)).fetchone()
+            if row and row['count']>=limit: raise APIError(429,'Zu viele Versuche. Bitte warte 15 Minuten.')
+            db.execute('INSERT INTO rate_limits VALUES(?,?,?,1) ON CONFLICT(bucket,subject) DO UPDATE SET count=count+1',(bucket,subject,now))
+            db.commit()
+
+    def email(self, data):
+        email=self.field(data,'email',3,254).lower()
+        if not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}",email):
+            raise APIError(400,'Bitte gib eine gültige E-Mail-Adresse ein.')
+        return email
+
+    def verification(self, db, uid, email):
+        token=secrets.token_urlsafe(32)
+        now=int(time.time())
+        db.execute('BEGIN IMMEDIATE')
+        previous=db.execute('SELECT sent FROM email_tokens WHERE user_id=?',(uid,)).fetchone()
+        if previous and previous['sent']>now-60:
+            raise APIError(429,'Bitte warte eine Minute, bevor du eine neue Bestätigungsmail anforderst.')
+        db.execute('INSERT INTO email_tokens VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token,expires=excluded.expires,sent=excluded.sent',
+                   (hashlib.sha256(token.encode()).hexdigest(),uid,now+VERIFY_TTL,now))
+        db.commit()
+        try: send_verification(email,token)
+        except APIError:
+            # Permit an immediate retry after provider failure; keep the pending account.
+            db.execute('UPDATE email_tokens SET sent=0 WHERE user_id=? AND token=?',(uid,hashlib.sha256(token.encode()).hexdigest()))
+            db.commit()
+            raise
+
     def api(self, db, method):
         parsed = urlsplit(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
+        if method=='GET' and path=='/api/topics':
+            rows=db.execute("SELECT t.*,(SELECT COUNT(*) FROM posts p WHERE p.category=t.slug AND p.kind='forum') AS posts FROM topics t ORDER BY t.rowid").fetchall()
+            return self.respond(200,{'topics':[dict(r) for r in rows]})
         if method=='GET' and path=='/api/me':
             user=self.user(db)
             return self.respond(200,{'user':dict(user) if user else None})
@@ -176,37 +280,62 @@ class Handler(BaseHTTPRequestHandler):
         if method=='GET' and match:
             post=db.execute("SELECT p.*,COALESCE(u.username,'Redaktion') AS author FROM posts p LEFT JOIN users u ON u.id=p.user_id WHERE p.id=?",(match[1],)).fetchone()
             if not post: raise APIError(404,'Beitrag nicht gefunden.')
-            comments=db.execute('SELECT c.id,c.body,c.created,u.username AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created,c.id',(match[1],)).fetchall()
+            comments=db.execute('SELECT c.id,c.body,c.created,c.user_id,u.username AS author FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created,c.id',(match[1],)).fetchall()
             return self.respond(200,{'post':dict(post),'comments':[dict(c) for c in comments]})
-        if method not in ('POST','DELETE'): raise APIError(404,'Nicht gefunden.')
+        if method not in ('POST','DELETE','PATCH'): raise APIError(404,'Nicht gefunden.')
         data=self.body()
-        if method=='POST' and path in ('/api/register','/api/login'):
-            now=time.time(); ip=self.client_address[0]
-            # Remove expired entries to bound memory consumption.
-            for key in list(self.attempts):
-                if self.attempts[key][0]<now-900: del self.attempts[key]
-            started,count=self.attempts.get(ip,(now,0))
-            if count>=20: raise APIError(429,'Zu viele Anmeldeversuche. Bitte warte 15 Minuten.')
-            self.attempts[ip]=(started,count+1)
-            username=self.field(data,'username',3,24)
-            password=self.field(data,'password',10,128)
-            if not re.fullmatch(r'[A-Za-z0-9_-]+',username): raise APIError(400,'Nutzername: nur Buchstaben, Zahlen, _ und -.')
-            if path=='/api/register':
-                try:
-                    result=db.execute('INSERT INTO users(username,password,created) VALUES(?,?,?)',(username,password_hash(password),int(now)))
-                    uid=result.lastrowid
-                except sqlite3.IntegrityError: raise APIError(409,'Dieser Nutzername ist bereits vergeben.')
-            else:
-                row=db.execute('SELECT * FROM users WHERE username=?',(username,)).fetchone()
-                # Perform a hash even for unknown accounts.
-                valid=password_matches(password,row['password']) if row else password_matches(password,'0'*32+':'+'0'*128)
-                if not valid: raise APIError(401,'Nutzername oder Passwort stimmt nicht.')
-                uid=row['id']
-            token=secrets.token_urlsafe(32)
-            db.execute('DELETE FROM sessions WHERE expires<=?',(int(now),))
-            db.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),uid,int(now)+SESSION_TTL))
+        if method=='POST' and path=='/api/verify-email':
+            self.rate_limit(db, 'verify', 30)
+            token=self.field(data, 'token', 40, 100)
+            hashed=hashlib.sha256(token.encode()).hexdigest()
+            # One transaction makes concurrent redemption single-use.
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT * FROM email_tokens WHERE token=? AND expires>?',(hashed,int(time.time()))).fetchone()
+            if not row: raise APIError(400,'Dieser Bestätigungslink ist ungültig oder abgelaufen. Fordere bitte einen neuen an.')
+            db.execute('UPDATE users SET email_verified=1 WHERE id=?',(row['user_id'],))
+            db.execute('DELETE FROM email_tokens WHERE user_id=?',(row['user_id'],))
             db.commit()
-            user=dict(db.execute('SELECT id,username,admin FROM users WHERE id=?',(uid,)).fetchone())
+            return self.respond(200,{'ok':True})
+        if method=='POST' and path in ('/api/register','/api/login','/api/request-verification'):
+            self.rate_limit(db, 'auth', 20)
+            password=data.get('password','')
+            if not isinstance(password,str) or not 10 <= len(password) <= 128:
+                raise APIError(400,'Das Passwort muss 10–128 Zeichen lang sein.')
+            if path=='/api/register':
+                mail_configuration()
+                username=self.field(data,'username',3,24)
+                if not re.fullmatch(r'[A-Za-z0-9_-]+',username): raise APIError(400,'Nutzername: nur Buchstaben, Zahlen, _ und -.')
+                email=self.email(data)
+                try:
+                    result=db.execute('INSERT INTO users(username,password,created,email) VALUES(?,?,?,?)',(username,password_hash(password),int(time.time()),email))
+                    uid=result.lastrowid
+                    db.commit()
+                except sqlite3.IntegrityError: raise APIError(409,'Nutzername oder E-Mail-Adresse ist bereits vergeben. Melde dich an oder fordere eine neue Bestätigung an.')
+                self.verification(db,uid,email)
+                return self.respond(201,{'verification_required':True, 'message':'Bitte bestätige deine E-Mail-Adresse. Schau auch im Spam-Ordner nach.'})
+            identifier=self.field(data,'identifier',3,254)
+            row=db.execute('SELECT * FROM users WHERE username=? OR email=?',(identifier,identifier)).fetchone()
+            valid=password_matches(password,row['password']) if row else password_matches(password,'0'*32+':'+'0'*128)
+            if not valid: raise APIError(401,'Zugangsdaten stimmen nicht.')
+            if path=='/api/request-verification':
+                mail_configuration()
+                if row['email_verified']: return self.respond(200,{'message':'Deine E-Mail-Adresse ist bereits bestätigt. Du kannst dich anmelden.'})
+                email=row['email'] or self.email(data)
+                if not row['email']:
+                    try:
+                        db.execute('UPDATE users SET email=? WHERE id=?',(email,row['id']))
+                        db.commit()
+                    except sqlite3.IntegrityError: raise APIError(409,'Diese E-Mail-Adresse kann nicht verwendet werden.')
+                self.verification(db,row['id'],email)
+                return self.respond(200,{'message':'Bestätigungsmail versendet. Bitte prüfe dein Postfach und den Spam-Ordner.'})
+            if not row['email_verified']:
+                raise APIError(403,'Bitte bestätige zuerst deine E-Mail-Adresse. Bestehende Konten können hier ihre Adresse ergänzen.', 'EMAIL_UNVERIFIED')
+            token=secrets.token_urlsafe(32)
+            now=int(time.time())
+            db.execute('DELETE FROM sessions WHERE expires<=?',(now,))
+            db.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),row['id'],now+SESSION_TTL))
+            db.commit()
+            user={key:row[key] for key in ('id','username','admin','email_verified')}
             secure='; Secure' if os.environ.get('COOKIE_SECURE')=='1' else ''
             return self.respond(200,{'user':user},f'session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL}{secure}')
         user=self.require_user(db)
@@ -215,12 +344,21 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('DELETE FROM sessions WHERE token=?',(hashlib.sha256(cookie['session'].value.encode()).hexdigest(),))
             db.commit()
             return self.respond(200,{'ok':True},'session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0')
+        if method=='POST' and path=='/api/topics':
+            if not user['admin']: raise APIError(403,'Nur Administratoren dürfen Themenbereiche erstellen.')
+            name=self.field(data,'name',3,80)
+            description=self.field(data,'description',10,300)
+            slug=secrets.token_hex(8)
+            try: db.execute('INSERT INTO topics VALUES(?,?,?)',(slug,name,description))
+            except sqlite3.IntegrityError: raise APIError(409,'Diesen Themenbereich gibt es bereits.')
+            db.commit()
+            return self.respond(201,{'slug':slug})
         if method=='POST' and path=='/api/posts':
             kind=data.get('kind','forum')
             if kind not in ('forum','blog'): raise APIError(400,'Ungültiger Beitragstyp.')
             if kind=='blog' and not user['admin']: raise APIError(403,'Blogartikel können nur von der Redaktion veröffentlicht werden.')
             category=data.get('category')
-            if category not in CATEGORIES: raise APIError(400,'Bitte wähle eine Kategorie.')
+            if not isinstance(category,str) or not db.execute('SELECT 1 FROM topics WHERE slug=?',(category,)).fetchone(): raise APIError(400,'Bitte wähle eine Kategorie.')
             title=self.field(data,'title',5,140); body=self.field(data,'body',20,15000)
             result=db.execute('INSERT INTO posts(kind,category,title,body,user_id,created) VALUES(?,?,?,?,?,?)',(kind,category,title,body,user['id'],int(time.time())))
             db.commit()
@@ -232,6 +370,28 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('INSERT INTO comments(post_id,user_id,body,created) VALUES(?,?,?,?)',(comment[1],user['id'],body,int(time.time())))
             db.commit()
             return self.respond(201,{'ok':True})
+        comment_match=re.fullmatch(r'/api/comments/(\d+)',path)
+        if method in ('PATCH','DELETE') and comment_match:
+            row=db.execute('SELECT user_id FROM comments WHERE id=?',(comment_match[1],)).fetchone()
+            if not row: raise APIError(404,'Antwort nicht gefunden.')
+            if row['user_id']!=user['id'] and not user['admin']: raise APIError(403,'Nur Autor und Administratoren dürfen diese Antwort bearbeiten.')
+            if method=='PATCH':
+                body=self.field(data,'body',2,5000)
+                db.execute('UPDATE comments SET body=? WHERE id=?',(body,comment_match[1]))
+            else: db.execute('DELETE FROM comments WHERE id=?',(comment_match[1],))
+            db.commit()
+            return self.respond(200,{'ok':True})
+        if method=='PATCH' and match:
+            post=db.execute('SELECT * FROM posts WHERE id=?',(match[1],)).fetchone()
+            if not post: raise APIError(404,'Beitrag nicht gefunden.')
+            if post['user_id']!=user['id'] and not user['admin']: raise APIError(403,'Nur Autor und Administratoren dürfen diesen Beitrag bearbeiten.')
+            title=self.field(data,'title',5,140)
+            body=self.field(data,'body',20,15000)
+            category=data.get('category')
+            if not isinstance(category,str) or not db.execute('SELECT 1 FROM topics WHERE slug=?',(category,)).fetchone(): raise APIError(400,'Bitte wähle eine Kategorie.')
+            db.execute('UPDATE posts SET title=?,body=?,category=? WHERE id=?',(title,body,category,match[1]))
+            db.commit()
+            return self.respond(200,{'ok':True})
         if method=='DELETE' and match:
             post=db.execute('SELECT user_id FROM posts WHERE id=?',(match[1],)).fetchone()
             if not post: raise APIError(404,'Beitrag nicht gefunden.')
